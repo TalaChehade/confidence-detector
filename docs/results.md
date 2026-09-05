@@ -160,7 +160,7 @@ Eleven test topics have perfect accuracy, but the perfect scores should be inter
 Taken together, the results support four guarded conclusions:
 
 1. **The confidence-only method detects token-level uncertainty, but uncertainty is not equivalent to factual incorrectness.** It flags two of three correct demonstration answers and flags several answers that are labelled correct in the test suite.
-2. **The current full-$K$ rule is operationally inactive on the 13-case suite.** Since it never triggers, it cannot currently be compared meaningfully with confidence-only in terms of detection quality.
+2. **The current full-K rule is operationally inactive on the 13-case suite.** Since it never triggers, it cannot currently be compared meaningfully with confidence-only in terms of detection quality.
 3. **The replicated pairwise scorer has strong overall discrimination.** ROC AUC is above 0.92 on both splits, and pairwise accuracy exceeds 0.92 on both.
 4. **Generalization is weaker for particular topics.** Health is weak on both evaluation and test data, while Economics and Science become especially problematic on the test split. This points toward domain sensitivity, data variation, or insufficient topic coverage.
 
@@ -175,6 +175,10 @@ The method operates partly at token level, but the tokenizer splits words and na
 ### 6.2 Temporal and ambiguous questions
 
 Questions such as the last president of the United States are time-sensitive. The result export has a current answer but no timestamp or reference date. Such items need explicit temporal framing; otherwise, a disagreement may reflect changing truth conditions rather than model failure.
+
+### 6.3 The detector fires on syntactic scaffolding, not just factual uncertainty.
+
+Verbs that lack real information trigger low confidence scores and lead to retrieval even when unnecessary. Additionally, restating the question in the response flags the sentence as low confidence.
 
 ## 7. Recommended future approach
 
