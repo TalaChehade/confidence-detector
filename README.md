@@ -8,42 +8,65 @@ The commands below take a new user from cloning the repository to the generated 
 
 ## Pipeline overview
 
-Training follows this path:
+There are two connected parts: first, the project learns what confident and
+unconfident language look like inside Mistral; second, it uses that learned
+direction to score each token in a new answer.
 
-```text
-confidence_statements1.json
-          |
-          v
-confident / unconfident statements
-          |
-          v
-progressively truncated prefixes
-          |
-          v
-Mistral-7B hidden states, layers 10-25
-          |
-          v
-paired hidden-state differences
-          |
-          v
-mean centering and one-component PCA
-          |
-          v
-PCA sign correction
-          |
-          v
-models/inker_rep_reader.pkl
+### A. Learn the confidence direction
+
+```mermaid
+flowchart LR
+    A[confidence_statements1.json] --> B[Confident and unconfident statements]
+    B --> C[Progressively truncated prefixes]
+    C --> D[Mistral hidden states<br/>layers 10-25]
+    D --> E[Paired hidden-state differences]
+    E --> F[Center differences]
+    F --> G[One-component PCA per layer]
+    G --> H[Correct PCA sign]
+    H --> I[(inker_rep_reader.pkl)]
+
+    classDef input fill:#e8f1ff,stroke:#377dbe,color:#12304a;
+    classDef process fill:#f4f0ff,stroke:#7957b8,color:#2b1d4d;
+    classDef output fill:#e7f6ed,stroke:#37845a,color:#153d25;
+    class A input;
+    class B,C,D,E,F,G,H process;
+    class I output;
 ```
 
-Generated-answer scoring follows this path:
+**In plain language:** the training script creates matched examples, observes
+their hidden states, and compresses the difference into one direction per
+layer. That collection of directions is the representation reader used by all
+later experiments.
 
-```text
-question -> Mistral answer -> hidden state for each answer token
-          -> signed projection -> layer average -> raw score m_i
-          -> causal min-max normalization -> m_tilde_i
+### B. Score a generated answer
+
+```mermaid
+flowchart LR
+    Q[Question] --> M[Mistral generates an answer]
+    M --> T[One hidden state per answer token]
+    T --> P[Project onto learned directions]
+    P --> L[Average layers 10-25]
+    L --> R[Raw token score m_i]
+    R --> N[Causal min-max normalization]
+    N --> S[Normalized confidence m_tilde_i]
+    S --> C[Confidence-only decision]
+    S --> K[Full-K score<br/>K(t_i) = (E - m_tilde_i) * s_i]
+
+    classDef input fill:#e8f1ff,stroke:#377dbe,color:#12304a;
+    classDef process fill:#fff4df,stroke:#c77b20,color:#4a2b08;
+    classDef decision fill:#e7f6ed,stroke:#37845a,color:#153d25;
+    class Q input;
+    class M,T,P,L,R,N process;
+    class S,C,K decision;
 ```
 
-The confidence-only experiment uses `confidence_i = m_tilde_i`. The full-K experiment uses `K(t_i) = (E - m_tilde_i) * s_i`. The mathematical derivation is in `docs/methodology.md`.
+**Why the normalization is causal:** when token `i` is scored, only tokens
+`0...i` are allowed to influence its normalized value. Future tokens cannot
+change an earlier confidence decision.
+
+The confidence-only experiment uses `confidence_i = m_tilde_i`. The full-K
+experiment uses `K(t_i) = (E - m_tilde_i) * s_i`. The complete mathematical
+derivation is in `docs/methodology.md`.
 
 ## Repository structure
 
