@@ -61,7 +61,7 @@ def main(config_path=None):
         f"{len(honest_statements)}"
     )
 
-    dataset = make_stratified_split(
+    dataset = make_split(
     honest_statements,
     untruthful_statements,
     pair_topics,
