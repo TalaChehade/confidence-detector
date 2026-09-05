@@ -61,12 +61,15 @@ def main(config_path=None):
         f"{len(honest_statements)}"
     )
 
-    dataset = make_split(
-        honest_statements,
-        untruthful_statements,
-        pair_topics,
-        n_train=config["detector"]["n_train"],
-    )
+    dataset = make_stratified_split(
+    honest_statements,
+    untruthful_statements,
+    pair_topics,
+    train_ratio=0.70,
+    eval_ratio=0.15,
+    test_ratio=0.15,
+    seed=0,
+)
 
     print(
         "Fitting INKER-recipe "
