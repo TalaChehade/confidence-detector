@@ -4,8 +4,6 @@ This repository contains a cleaned, modular implementation of the INKER confiden
 
 This guide is specifically for running the project in **Google Colab** with Google Drive. The default configuration expects a CUDA-capable Colab GPU and stores the trained reader and result files in Drive.
 
-> Important limitation: the confidence-direction/PCA pipeline is reproduced from the original experiment. The query-complexity value `E` is a rule-based proxy, not INKER's trained T5-large Eva evaluator. Read `docs/replication.md` before interpreting the full-K results.
-
 ## Pipeline overview
 
 The project has two stages: learn a confidence direction, then use it to score generated answers.
@@ -13,19 +11,34 @@ The project has two stages: learn a confidence direction, then use it to score g
 ### A. Learn the confidence direction
 
 ```mermaid
-flowchart LR
-    A[confidence_statements1.json] --> B[Confident and unconfident statements]
-    B --> C[Progressively truncated prefixes]
-    C --> D[Mistral hidden states<br/>layers 10-25]
-    D --> E[Paired hidden-state differences]
-    E --> F[Center differences]
-    F --> G[One-component PCA per layer]
-    G --> H[Correct PCA sign]
-    H --> I[(inker_rep_reader.pkl)]
+flowchart TD
+    subgraph Data ["1. Data Preparation"]
+        A["confidence_statements1.json (27 topics, each has 10 confident and 10 unconfident statements)"]
+        B["Progressively Truncated Prefixes + Template"]
+        C["Larger dataset (Take 512 pairs for training)"]
+    end
 
-    classDef input fill:#e8f1ff,stroke:#377dbe,color:#12304a;
-    classDef process fill:#f4f0ff,stroke:#7957b8,color:#2b1d4d;
-    classDef output fill:#e7f6ed,stroke:#37845a,color:#153d25;
+    subgraph Feature ["2. Feature Extraction & Processing"]
+        D["Mistral Hidden States\n(Layers 10–25)"]
+        E["Paired Hidden-State Differences"]
+        F["Center Differences\n(Zero-Mean)"]
+    end
+
+    subgraph Direction ["3. Direction Extraction"]
+        G["One-Component PCA\n(Per Layer)"]
+        H["Correct PCA Sign\n(Alignment Check)"]
+    end
+
+    subgraph Storage ["4. Output"]
+        I[("inker_rep_reader.pkl")]
+    end
+
+    A --> B --> C --> D --> E --> F --> G --> H --> I
+
+    classDef input fill:#EBF3FF,stroke:#2B6CB0,color:#1A365D,stroke-width:2px;
+    classDef process fill:#F3E8FF,stroke:#6B46C1,color:#322659,stroke-width:2px;
+    classDef output fill:#E6FFFA,stroke:#234E52,color:#1A202C,stroke-width:2px;
+    
     class A input;
     class B,C,D,E,F,G,H process;
     class I output;
@@ -36,28 +49,40 @@ flowchart LR
 ### B. Score a generated answer
 
 ```mermaid
-flowchart LR
-    Q[Question] --> M[Mistral generates an answer]
-    M --> T[One hidden state per answer token]
-    T --> P[Project onto learned directions]
-    P --> L[Average layers 10-25]
-    L --> R[Raw token score m_i]
-    R --> N[Causal min-max normalization]
-    N --> S[Normalized confidence m_tilde_i]
-    S --> C[Confidence-only decision]
-    S --> K[Full-K score<br/>K(t_i) = (E - m_tilde_i) * s_i]
+flowchart TD
+    subgraph Generation ["1. Output Generation"]
+        Q["Question Input"]
+        M["Mistral Model<br/><i>(Generates response tokens)</i>"]
+        T["Extract Hidden States<br/><i>(Shape: 16 layers × 4096 dimensions per token)</i>"]
+    end
 
-    classDef input fill:#e8f1ff,stroke:#377dbe,color:#12304a;
-    classDef process fill:#fff4df,stroke:#c77b20,color:#4a2b08;
-    classDef decision fill:#e7f6ed,stroke:#37845a,color:#153d25;
+    subgraph Scoring ["2. Confidence Scoring"]
+        P["Project onto Confidence Directions<br/><i>(Dot product with learned concept vectors)</i>"]
+        L["Average Across Target Layers<br/><i>(Mean score over Layers 10–25)</i>"]
+        R["Raw Token Score"]
+    end
+
+    subgraph Normalization ["3. Sequence Normalization"]
+        N["Causal Min-Max Scaling<br/><i>(Normalize relative to preceding tokens)</i>"]
+        S["Normalized Token Confidence"]
+    end
+
+    subgraph Decision ["4. Downstream Decision"]
+        C["Confidence-Based Evaluation"]
+    end
+
+    Q --> M --> T --> P --> L --> R --> N --> S --> C
+
+    classDef input fill:#EBF3FF,stroke:#2B6CB0,color:#1A365D,stroke-width:2px;
+    classDef process fill:#FFF4DF,stroke:#C77B20,color:#4A2B08,stroke-width:2px;
+    classDef decision fill:#E6FFFA,stroke:#234E52,color:#1A202C,stroke-width:2px;
+
     class Q input;
     class M,T,P,L,R,N process;
-    class S,C,K decision;
+    class S,C decision;
 ```
 
 **Why normalization is causal:** when token `i` is scored, only tokens `0...i` can influence its normalized value. Future tokens cannot change an earlier confidence decision.
-
-The confidence-only experiment uses `confidence_i = m_tilde_i`. The full-K experiment uses `K(t_i) = (E - m_tilde_i) * s_i`. The full mathematical derivation is in `docs/methodology.md`.
 
 ## Repository structure
 
@@ -217,7 +242,7 @@ This is the longest step and may require substantial GPU memory. Do not rerun it
 
 ## 8. Evaluate the synthetic replication
 
-Run after training completes:
+Run after training completes and once you have the inker_rep_reader.pkl file saved:
 
 ```bash
 !python experiments/evaluate_detector.py
@@ -233,7 +258,7 @@ results/replication/test_per_topic.csv
 
 ## 9. Run confidence-only inference
 
-Run after the reader has been trained:
+Run after training completes and once you have the inker_rep_reader.pkl file saved:
 
 ```bash
 !python experiments/run_confidence_only.py
@@ -248,7 +273,7 @@ results/confidence_only/confidence_only_tokens.csv
 
 ## 10. Run the full-K test suite
 
-Run after the reader has been trained:
+Run after training completes and once you have the inker_rep_reader.pkl file saved:
 
 ```bash
 !python experiments/run_test_suite.py
@@ -261,70 +286,5 @@ results/full_k/test_suite_questions.csv
 results/full_k/test_suite_tokens.csv
 ```
 
-The `auto_correct` column is only a substring check when an expected answer exists. It is not a robust semantic correctness metric.
+## Results Analysis
 
-## 11. Complete Colab cell order
-
-After the setup cells, run these cells in order:
-
-```bash
-!python experiments/train_detector.py
-```
-
-```bash
-!python experiments/evaluate_detector.py
-```
-
-```bash
-!python experiments/run_confidence_only.py
-```
-
-```bash
-!python experiments/run_test_suite.py
-```
-
-If the reader already exists in Drive, skip the training cell.
-
-## 12. Understand the final results
-
-Inspect the files in this order:
-
-1. `replication_metrics.csv`: checks whether the learned direction separates synthetic confident and unconfident examples.
-2. `eval_per_topic.csv` and `test_per_topic.csv`: show topics with weak or unstable separation.
-3. `confidence_only_questions.csv` and its token file: show generated answers and normalized confidence values.
-4. `test_suite_questions.csv` and its token file: compare full-K and confidence-only decisions.
-5. `docs/results.md`: record metrics, failure cases, configuration, and conclusions after a run.
-
-The full-K results use the rule-based `E` proxy, not INKER's trained Eva evaluator. Claims about complete end-to-end INKER reproduction must therefore be qualified.
-
-## Troubleshooting
-
-**CUDA is unavailable**
-
-Open **Runtime > Change runtime type**, select **GPU**, reconnect, and rerun the GPU check cell.
-
-**Colab disconnected or restarted**
-
-Remount Drive, change back to the repository directory with `%cd confidence-detector`, reinstall requirements if needed, and continue from the last completed step. The trained reader and CSV files in Drive are preserved.
-
-**`FileNotFoundError: Representation reader not found`**
-
-Run the training cell first and confirm that `inker_rep_reader.pkl` exists in the Drive `models` directory.
-
-**CUDA out of memory**
-
-Reduce `detector.batch_size` or `detector.max_length` in `configs/default.yaml`, restart the runtime, and rerun training. Record configuration changes with the results.
-
-**Hugging Face authentication or access errors**
-
-Confirm that the `HF_TOKEN` Colab Secret is available to the notebook, that the account has access to the Mistral model, and rerun the `login(userdata.get("HF_TOKEN"))` cell.
-
-**Missing dataset**
-
-Confirm that `confidence_statements1.json` is in the exact Drive path shown in Step 5 and that the dataset check prints `True`.
-
-## Further documentation
-
-- `docs/methodology.md`: mathematical derivation of the detector and scoring.
-- `docs/replication.md`: preserved behavior, intentional quirks, and replication limits.
-- `docs/results.md`: template for recording empirical results and analysis.
