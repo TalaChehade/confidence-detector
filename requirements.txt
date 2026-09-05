@@ -1,0 +1,11 @@
+torch
+transformers
+accelerate
+bitsandbytes
+scikit-learn
+numpy
+pandas
+tqdm
+PyYAML
+huggingface_hub
+nltk

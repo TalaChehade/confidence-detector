@@ -1,0 +1,25 @@
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+.env
+.venv/
+venv/
+
+# Secrets
+*.token
+
+# Local model/data/results artifacts
+*.pkl
+*.pt
+*.pth
+*.bin
+*.safetensors
+
+# Optional local mirrors of Drive content
+datasets/
+models/
+results/
+logs/
+
+.DS_Store
+Thumbs.db
