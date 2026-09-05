@@ -17,7 +17,7 @@ A key distinction is necessary throughout: a trigger indicates that the method c
 | Experimental layer | Files | Main purpose |
 |---|---|---|
 | Confidence-only demonstration | `confidence_only_questions.csv`, `confidence_only_tokens.csv` | Examine token-level confidence and aggregate confidence for three factual answers. |
-| Full test suite | `test_suite_questions.csv`, `test_suite_tokens.csv` | Compare full-$K$ and confidence-only trigger decisions across deliberately varied question types. |
+| Full test suite | `test_suite_questions.csv`, `test_suite_tokens.csv` | Compare full-K and confidence-only trigger decisions across deliberately varied question types. |
 | Replication benchmark | `replication_metrics.csv`, `eval_per_topic.csv`, `test_per_topic.csv` | Measure how well the replicated scoring method separates paired examples overall and by topic. |
 
 The token files provide intermediate evidence for the question-level decisions. Punctuation and end-of-sequence tokens are skipped or left without a score; this is expected and should not be treated as missing model output.
