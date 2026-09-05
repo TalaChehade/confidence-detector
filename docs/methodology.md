@@ -167,7 +167,9 @@ Punctuation, stop words, and formatting markers do not reflect factual confidenc
 
 $$s_i = \begin{cases} 1 & \text{if } t_i \text{ is a content token} \\ 0 & \text{if } t_i \text{ is a stop word or ignored token} \end{cases}$$
 
-Only content tokens ($s_i = 1$) participate in retrieval triggering decisions.
+Ignored tokens receive no raw or normalized confidence score and are excluded
+from the causal normalization window. Only content tokens ($s_i = 1$)
+participate in retrieval triggering decisions.
 
 
 ## 13. Standalone Confidence-Only Experiment

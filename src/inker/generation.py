@@ -2,6 +2,20 @@ import re
 import numpy as np
 import torch
 
+FALLBACK_STOP_WORDS = {
+    "a", "an", "and", "are", "as", "at", "be", "been", "but",
+    "by", "for", "from", "had", "has", "have", "he", "her", "here",
+    "hers", "herself", "him", "himself", "his", "how", "i", "if",
+    "in", "into", "is", "it", "its", "itself", "me", "more", "most",
+    "my", "myself", "no", "nor", "not", "of", "on", "or", "our",
+    "ours", "ourselves", "she", "so", "some", "such", "than", "that",
+    "the", "their", "theirs", "them", "themselves", "then", "there",
+    "these", "they", "this", "those", "to", "too", "under", "until",
+    "up", "very", "was", "we", "were", "what", "when", "where", "which",
+    "who", "whom", "why", "will", "with", "you", "your", "yours",
+    "yourself", "yourselves",
+}
+
 try:
     import nltk
     from nltk.corpus import stopwords
@@ -16,9 +30,7 @@ try:
             stopwords.words("english")
         )
 except Exception:
-    # This fallback should rarely be used. Installing NLTK and its stopword
-    # corpus is recommended for faithful reproduction.
-    STOP_WORDS = set()
+    STOP_WORDS = FALLBACK_STOP_WORDS
 
 
 SPECIAL_TOKENS = {
@@ -163,6 +175,17 @@ def _generate_and_score_raw_tokens(
             if clean in STOP_WORDS
             else 1
         )
+
+        if s_i == 0:
+            token_entries.append({
+                "token_index": i,
+                "token": token,
+                "raw_score": None,
+                "s_i": 0,
+                "skip": True,
+                "is_content": False,
+            })
+            continue
 
         layer_scores = []
 
