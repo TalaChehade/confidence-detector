@@ -2,21 +2,15 @@
 
 ## 1. Goal
 
-The detector learns directions in a language model's hidden-state space that
-separate text phrased confidently from text phrased unconfidently. Those
-directions are then used to assign confidence scores to generated answer tokens.
+The detector learns directions in a language model's hidden-state space that separate text phrased confidently from text phrased unconfidently. Those directions are then used to assign confidence scores to generated answer tokens.
 
-The current implementation uses Mistral-7B-Instruct-v0.1 and transformer layers
-10 through 25.
+The current implementation uses Mistral-7B-Instruct-v0.1 and transformer layers 10 through 25.
 
 ## 2. Training data construction
 
-For each topic, the source JSON contains confident and unconfident statements.
-Each confident statement is paired with an unconfident statement.
+For each topic, the source JSON contains confident and unconfident statements. Each confident statement is paired with an unconfident statement.
 
-Both statements are tokenized and converted into progressively truncated
-prefixes. If the two statements yield different numbers of prefixes, `zip`
-keeps only the shared number of truncations.
+Both statements are tokenized and converted into progressively truncated prefixes. If the two statements yield different numbers of prefixes, `zip` keeps only the shared number of truncations.
 
 Each confident prefix is wrapped with:
 
@@ -26,244 +20,196 @@ Each unconfident prefix is wrapped with:
 
 `[INST] Pretend you're an unconfident person making statements about the world. [/INST]`
 
-## 3. Last-token hidden-state representation
+## 3. Extracting the Representation
 
-For text `x`, layer `l`, and hidden dimension `d`, let
+To measure what the model "knows," we extract the hidden representation of a text input $x$ at a specific layer $l$.
 
-`h_l(x) in R^d`
+* **Representative Token:** We look at the final real token in the sequence.
 
-denote the hidden state at the representative token.
+## 4. Measuring Differences Between Paired Examples
 
-The tokenizer uses left padding and the detector uses `rep_token = -1`, so the
-representation is the final real token for every sequence in a batch.
+We train the detector using pairs of statements (one confident, one unconfident).
 
-## 4. Paired differences
+1. Training examples are grouped into consecutive pairs in a flattened array.
 
-After the two members of each training pair are randomly ordered, hidden states
-occur consecutively in the flattened training array.
+```text
+[ Pair i: Confident ]   --->  h_(2i)
+[ Pair i: Unconfident ] --->  h_(2i+1)   ==>   Δh_i^(l) = h_(2i)^(l) - h_(2i+1)^(l)
+```
 
-For pair `i` at layer `l`, the code forms
+2. For pair $i$ at layer $l$, we compute the raw vector difference:
 
-`Delta h_i^(l) = h_(2i)^(l) - h_(2i+1)^(l)`.
+$$\Delta h_i^{(l)} = h_{2i}^{(l)} - h_{2i+1}^{(l)}$$
 
-Because the pair order is randomized, this difference is not guaranteed to be
-confident-minus-unconfident. PCA is sign-invariant, and orientation is corrected
-later.
+> **Note:** Because the order within each pair is randomized, this difference might be $(\text{Confident} - \text{Unconfident})$ or $(\text{Unconfident} - \text{Confident})$. PCA finds the axis of variation regardless of orientation, which is corrected in later steps.
 
-## 5. Mean centering
 
-For `N` paired differences,
+## 5. Centering the Difference Vectors
 
-`mu_l = (1/N) * sum_i Delta h_i^(l)`.
+Before running PCA, we center the difference vectors around their mean.
 
-The centered difference is
+1. Calculate the average difference vector across all $N$ training pairs:
 
-`z_i^(l) = Delta h_i^(l) - mu_l`.
+$$\mu_l = \frac{1}{N} \sum_{i=1}^{N} \Delta h_i^{(l)}$$
 
-The stored `H_train_means[l]` is this mean of the paired-difference
-representations, with shape `(1, d)`.
+2. Subtract this mean from each pair's difference to get the centered difference $z_i^{(l)}$:
 
-## 6. PCA confidence direction
+$$z_i^{(l)} = \Delta h_i^{(l)} - \mu_l$$
 
-For every selected layer independently, one-component PCA is fitted to the
-centered paired differences.
 
-Equivalently, the first principal component is the unit vector `v_l` that
-maximizes projected variance:
+## 6. Finding the "Confidence Axis" via PCA
 
-`v_l = argmax_(||v||=1) sum_i ( z_i^(l) dot v )^2`.
+We identify the direction in the model's hidden space that captures the most variance between confident and unconfident statements.
 
-This is the dominant axis along which the paired confident/unconfident
-representations vary.
+For each selected layer independently, we fit a 1-component PCA to find a unit vector $v_l$ that maximizes projected variance:
 
-PCA does not define an intrinsic sign: `v_l` and `-v_l` describe the same axis.
+$$v_l = \arg\max_{\|v\|=1} \sum_i \left( z_i^{(l)} \cdot v \right)^2$$
 
-## 7. Sign correction
+This unit vector $v_l$ represents the **dominant axis of variation** between confident and unconfident representations.
 
-The original, un-differenced training hidden states are centered using the
-stored mean and projected onto `v_l`.
 
-For every training pair, the code checks whether the known confident member has
-the minimum or maximum projection.
+## 7. Aligning the Direction (Sign Correction)
 
-Let:
+PCA determines the line of variation, but not its direction ($v_l$ and $-v_l$ are equivalent). We orient $v_l$ so that positive projections reliably indicate higher confidence.
 
-`p_max = fraction of pairs where confident member has maximum projection`
+1. Center the original (un-differenced) hidden states using $\mu_l$ and project them onto $v_l$.
+2. For each training pair, check whether the known confident statement gets the higher or lower projection.
+3. Compute the proportions:
+   * $p_{\text{max}}$: Fraction of pairs where the confident statement has the **maximum** projection.
+   * $p_{\text{min}}$: Fraction of pairs where the confident statement has the **minimum** projection.
+4. Determine the direction sign:
 
-`p_min = fraction of pairs where confident member has minimum projection`
+$$\text{sign}_l = \text{sign}(p_{\text{max}} - p_{\text{min}})$$
 
-Then:
 
-`sign_l = sign(p_max - p_min)`.
+## 8. Scoring a Statement
 
-If the result is zero, the implementation uses `+1`.
+To score a new text $x$ at layer $l$, center its representation, project it onto $v_l$, and apply the sign correction:
 
-The PCA direction itself remains unchanged. The sign is stored separately and
-must be applied exactly once during scoring.
+$$m_l(x) = \text{sign}_l \cdot \left( (h_l(x) - \mu_l) \cdot v_l \right)$$
 
-## 8. Statement confidence score
+To get the overall **Statement Confidence Score**, average $m_l(x)$ across all evaluated layers $L = \{10, 11, \dots, 25\}$:
 
-For a new representation `h_l(x)`, the layer score is:
+$$m(x) = \frac{1}{|L|} \sum_{l \in L} m_l(x)$$
 
-`m_l(x) = sign_l * ((h_l(x) - mu_l) dot v_l)`.
 
-Scores are averaged across the selected layers:
+## 9. Evaluating Performance (Synthetic Testing)
 
-`m(x) = (1/|L|) * sum_(l in L) m_l(x)`.
+To evaluate the detector, test texts are arranged as alternating pairs:
 
-For the current configuration:
+$$\text{Texts} = [\text{confident}_1, \text{unconfident}_1, \text{confident}_2, \text{unconfident}_2, \dots]$$
 
-`L = {10, 11, ..., 25}`.
+*(If the total text count is odd, the trailing statement is discarded.)*
 
-## 9. Synthetic evaluation
+Binary labels are generated as $[1, 0, 1, 0, \dots]$. Two key metrics are computed:
 
-Eval/test texts are arranged conceptually as:
+* **ROC-AUC:** Overall score separation between confident and unconfident texts.
+* **Pairwise Accuracy:** Fraction of pairs satisfying $\text{score}(\text{confident}) > \text{score}(\text{unconfident})$.
 
-`[confident_1, unconfident_1, confident_2, unconfident_2, ...]`.
 
-If a split contains an odd number of texts, the trailing text is discarded.
+## 10. Scoring Generated Answer Tokens
 
-Binary labels are generated as:
+During inference, we evaluate confidence token-by-token as the model generates an answer.
 
-`[1, 0, 1, 0, ...]`.
+```text
++-----------------------------------------------------------------------+
+|  Input Prompt                                                         |
+|  [INST] Answer the question directly and concisely... QUESTION [/INST] |
++-----------------------------------------------------------------------+
+                                    │
+                                    ▼
++-----------------------------------------------------------------------+
+|  Generated Answer: "The capital of France is Paris."                  |
++-----------------------------------------------------------------------+
+                                    │
+                                    ▼
+             Extract Hidden States for Every Generated Token
+                                    │
+                                    ▼
+        Apply Signed PCA Projection across Layers L = {10..25}
+                                    │
+                                    ▼
+        Raw Token Confidence Scores: [m_0, m_1, m_2, ..., m_n]
+```
 
-Two metrics are computed:
+1. Format the question inside the instruction template.
+2. Generate the answer deterministically (`do_sample=False`).
+3. Pass the full `Prompt + Answer` sequence back through the model to extract hidden states for each generated token $t_i$.
+4. Compute raw token score $m_i$ by applying the signed PCA projection across layers $L$ and averaging them.
 
-- ROC-AUC over all text scores.
-- Pairwise accuracy: the fraction of pairs satisfying
-  `score(confident) > score(unconfident)`.
 
-## 10. Generated answer token scoring
+## 11. Causal Score Normalization
 
-A question is wrapped as:
+Raw scores fluctuate depending on context. To normalize scores to $[0, 1]$ without looking into the future, we use a **causal sliding window**.
 
-`[INST] Answer the question directly and concisely. Do not provide extra context.
+For token $i$, define the causal window using current and past raw scores:
 
-QUESTION [/INST]`
+$$W_i = \{m_0, m_1, \dots, m_i\}$$
 
-Generation is deterministic (`do_sample=False`).
+Find the local minimum and maximum:
 
-The complete prompt+answer sequence is passed through Mistral again so the
-hidden state of every generated token can be extracted.
+$$\text{lo}_i = \min(W_i), \quad \text{hi}_i = \max(W_i)$$
 
-For generated token `t_i`, the same signed confidence projection is computed at
-every selected layer and averaged, producing a raw token score `m_i`.
+Compute the normalized score $\tilde{m}_i$:
 
-## 11. Causal normalization
+$$\tilde{m}_i = \begin{cases} 0.5 & \text{if } i = 0 \text{ or } (\text{hi}_i - \text{lo}_i) < 10^{-8} \\[6pt] \dfrac{m_i - \text{lo}_i}{\text{hi}_i - \text{lo}_i} & \text{otherwise} \end{cases}$$
 
-Raw token scores are converted to a normalized sequence without looking at
-future tokens.
+This ensures $\tilde{m}_i \in [0, 1]$ while strictly respecting causality.
 
-For token `i`, define the causal window:
 
-`W_i = {m_0, ..., m_i}`.
+## 12. Filtering Non-Content Tokens
 
-Let:
+Punctuation, stop words, and formatting markers do not reflect factual confidence. We construct a **Content Mask** $s_i$:
 
-`lo_i = min(W_i)`
+1. Remove special tokenizer markers (`▁`, `Ġ`) and convert text to lowercase.
+2. Filter out standard NLTK English stop words and special formatting tokens.
+3. Define the mask:
 
-`hi_i = max(W_i)`.
+$$s_i = \begin{cases} 1 & \text{if } t_i \text{ is a content token} \\ 0 & \text{if } t_i \text{ is a stop word or ignored token} \end{cases}$$
 
-If `i = 0`, or if `hi_i - lo_i < 1e-8`, the normalized score is `0.5`.
+Only content tokens ($s_i = 1$) participate in retrieval triggering decisions.
 
-Otherwise:
 
-`m_tilde_i = (m_i - lo_i) / (hi_i - lo_i)`.
+## 13. Standalone Confidence-Only Experiment
 
-Therefore:
+In the simplified setup, we bypass $E$ and directly measure token confidence:
 
-`m_tilde_i in [0, 1]`.
+$$\text{confidence}_i = \tilde{m}_i$$
 
-A token's normalized score can depend only on itself and earlier tokens.
+* **Confident:** $\text{confidence}_i \ge 0.5$
+* **Unconfident:** $\text{confidence}_i < 0.5$
 
-## 12. Content-token mask
+The question-level confidence trigger activates if **at least one** content token ($s_i = 1$) has confidence below $0.5$.
 
-Special and formatting-only tokens are skipped.
 
-For remaining tokens, the tokenizer marker `▁` or `Ġ` is removed, the token is
-lowercased, and NLTK English stop words are filtered.
+## 16. Pipeline Architecture
 
-Define:
+```text
+================================================================================
+                                TRAINING PHASE
+================================================================================
+[ JSON Statements ] 
+       │
+       ▼
+[ Extract Hidden States (Mistral) ] ──► [ Compute Paired Differences ]
+                                                  │
+                                                  ▼
+[ Sign Correction ] ◄── [ PCA per Layer ] ◄── [ Mean Centering ]
+       │
+       ▼
+[ Save Projection Weights & Means ]
 
-`s_i = 1` for a content token,
-
-`s_i = 0` for a stop word or ignored token.
-
-Only content tokens participate in retrieval-trigger decisions.
-
-## 13. Query-complexity proxy E
-
-The current implementation does not contain INKER's trained T5-large Eva
-evaluator. It preserves the original notebook's rule-based stand-in.
-
-The cue set is:
-
-`{and, who, which, before, after, same, both, compare, than}`.
-
-If `n` is the number of words and `c` is the number of cue hits:
-
-`length_component = min(n / 25, 1)`
-
-`cue_component = min(c / 3, 1)`
-
-and:
-
-`E = 0.5 * length_component + 0.5 * cue_component`.
-
-`E` is clipped to `[0,1]` and rounded to four decimals.
-
-## 14. Full K(t_i) activation
-
-The full experiment computes:
-
-`K(t_i) = (E - m_tilde_i) * s_i`.
-
-With threshold `tau = 0.5`, the full detector triggers if any content token
-satisfies:
-
-`K(t_i) > tau`.
-
-The notebook also records an older comparison rule:
-
-`1 - m_tilde_i > tau`.
-
-At `tau = 0.5`, this corresponds to identifying tokens with
-`m_tilde_i < 0.5`.
-
-## 15. Standalone confidence-only experiment
-
-The later confidence-only experiment ignores `E` entirely and directly treats:
-
-`confidence_i = m_tilde_i`.
-
-A token is:
-
-- confident when `confidence_i >= 0.5`;
-- unconfident when `confidence_i < 0.5`.
-
-The question-level confidence-only trigger activates when any content token has
-confidence below the threshold.
-
-## 16. Pipeline
-
-Training:
-
-`JSON statements`
-` -> confident/unconfident prefixes`
-` -> Mistral hidden states`
-` -> paired differences`
-` -> mean centering`
-` -> PCA per layer`
-` -> sign correction`
-` -> saved representation reader`
-
-Inference:
-
-`question`
-` -> Mistral answer`
-` -> answer-token hidden states`
-` -> signed PCA projections`
-` -> average layers`
-` -> causal normalization`
-` -> content-token filter`
-` -> confidence-only trigger and/or K(t_i)`
+================================================================================
+                               INFERENCE PHASE
+================================================================================
+[ Input Question ]
+       │
+       ▼
+[ Generate Answer (Mistral) ] ──► [ Extract Token Hidden States ]
+                                                  │
+                                                  ▼
+[ Calculate Trigger K(t_i) ] ◄── [ Causal Normalization & Masking ] ◄── [ Signed PCA Projection ]
+       │
+       ▼
+[ Trigger Retrieval if K(t_i) > τ ]
+```
