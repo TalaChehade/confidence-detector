@@ -1,21 +1,14 @@
 # INKER Confidence Detector Replication
 
-A cleaned and modular implementation of the confidence-detector experiment used
-in the INKER replication work.
+This repository contains a cleaned, modular implementation of the confidence-detector experiment used in the INKER replication work. It loads Mistral-7B-Instruct, learns a confidence direction with paired hidden-state differences and PCA, and evaluates confidence on synthetic statements and generated answers.
 
-The repository separates model loading, dataset construction, hidden-state
-extraction, paired-difference PCA, scoring, token-level inference, and
-experiments so that the method can be reproduced without relying on one large
-Colab notebook.
+The commands below take a new user from cloning the repository to the generated result files. The default configuration expects a CUDA-capable GPU with enough memory for Mistral-7B in 4-bit mode. CPU-only execution is not a practical default for this experiment.
 
-> Important: the confidence-direction/PCA pipeline is reproduced from the
-> original experiment. The query-complexity value `E` is still a rule-based
-> proxy, not INKER's trained T5-large Eva evaluator. See
-> `docs/replication.md`.
+> Important limitation: the confidence-direction/PCA pipeline is reproduced from the original experiment. The query-complexity value `E` is a rule-based proxy, not INKER's trained T5-large Eva evaluator. Read `docs/replication.md` before interpreting the full-K results.
 
 ## Pipeline overview
 
-Training:
+Training follows this path:
 
 ```text
 confidence_statements1.json
@@ -33,52 +26,24 @@ Mistral-7B hidden states, layers 10-25
 paired hidden-state differences
           |
           v
-mean centering
-          |
-          v
-1-component PCA per layer
+mean centering and one-component PCA
           |
           v
 PCA sign correction
           |
           v
-inker_rep_reader.pkl
+models/inker_rep_reader.pkl
 ```
 
-Generated-answer confidence:
+Generated-answer scoring follows this path:
 
 ```text
-Question
-   |
-   v
-Mistral answer
-   |
-   v
-hidden state for each answer token
-   |
-   v
-signed projection onto PCA direction
-   |
-   v
-average layers 10-25
-   |
-   v
-raw confidence m_i
-   |
-   v
-causal min-max normalization
-   |
-   v
-m_tilde_i
-   |
-   +----------------------------+
-   |                            |
-   v                            v
-confidence-only             full activation
-confidence=m_tilde_i        K(t_i)=(E-m_tilde_i)s_i
+question -> Mistral answer -> hidden state for each answer token
+          -> signed projection -> layer average -> raw score m_i
+          -> causal min-max normalization -> m_tilde_i
 ```
 
-For the full mathematical derivation, see `docs/methodology.md`.
+The confidence-only experiment uses `confidence_i = m_tilde_i`. The full-K experiment uses `K(t_i) = (E - m_tilde_i) * s_i`. The mathematical derivation is in `docs/methodology.md`.
 
 ## Repository structure
 
@@ -87,10 +52,8 @@ inker-confidence-detector/
 ├── README.md
 ├── requirements.txt
 ├── .gitignore
-├── configs/
-│   └── default.yaml
-├── data/
-│   └── README.md
+├── configs/default.yaml
+├── data/README.md
 ├── docs/
 │   ├── methodology.md
 │   ├── replication.md
@@ -101,29 +64,25 @@ inker-confidence-detector/
 │   ├── evaluate_detector.py
 │   ├── run_confidence_only.py
 │   └── run_test_suite.py
-└── src/
-    └── inker/
-        ├── __init__.py
-        ├── config.py
-        ├── model.py
-        ├── dataset.py
-        ├── hidden_states.py
-        ├── directions.py
-        ├── scoring.py
-        ├── complexity.py
-        └── generation.py
+└── src/inker/
+    ├── config.py
+    ├── complexity.py
+    ├── dataset.py
+    ├── directions.py
+    ├── generation.py
+    ├── hidden_states.py
+    ├── model.py
+    └── scoring.py
 ```
 
-## External Google Drive structure
+## Artifact layout
 
-By default, artifacts are stored outside GitHub:
+The dataset, trained reader, and experiment outputs are kept outside GitHub because they can be large or externally distributed. By default, artifacts are stored at:
 
 ```text
 /content/drive/MyDrive/INKER_Confidence_Detector/
-├── datasets/
-│   └── confidence_statements1.json
-├── models/
-│   └── inker_rep_reader.pkl
+├── datasets/confidence_statements1.json
+├── models/inker_rep_reader.pkl
 ├── results/
 │   ├── replication/
 │   ├── confidence_only/
@@ -131,277 +90,252 @@ By default, artifacts are stored outside GitHub:
 └── logs/
 ```
 
-You can change these paths in `configs/default.yaml`.
+Change the artifact root in `configs/default.yaml` for a local run.
 
-## 1. Colab setup
+## 1. Clone the repository
 
-Mount Drive:
+```bash
+git clone https://github.com/TalaChehade/confidence-detector.git
+cd confidence-detector
+git status
+```
+
+The repository's source branch is available from GitHub as `main`.
+
+## 2. Create the Python environment
+
+Python 3.10 or 3.11 is recommended. With conda:
+
+```bash
+conda create -n inker-confidence python=3.11 -y
+conda activate inker-confidence
+python -m pip install -r requirements.txt
+```
+
+With a standard Python installation instead:
+
+```bash
+python -m venv .venv
+```
+
+On Windows PowerShell:
+
+```powershell
+.\.venv\Scripts\Activate.ps1
+```
+
+On macOS/Linux:
+
+```bash
+source .venv/bin/activate
+```
+
+Then install the dependencies:
+
+```bash
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+```
+
+For a local GPU run, install the PyTorch build appropriate for the installed CUDA version if the default PyTorch package does not match the machine.
+
+Verify the selected interpreter and GPU:
+
+```bash
+python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
+```
+
+The recommended run should print `True` for CUDA availability.
+
+## 3. Authenticate with Hugging Face
+
+The model is `mistralai/Mistral-7B-Instruct-v0.1`. You need a Hugging Face account, access to the model, and a user access token. Authenticate once:
+
+```bash
+hf auth login
+hf auth whoami
+```
+
+Never put the token in a source file, `default.yaml`, or a committed notebook.
+
+### Google Colab authentication
+
+Store the token in Colab Secrets under the name `HF_TOKEN`, then run:
 
 ```python
-from google.colab import drive
+from google.colab import drive, userdata
+from huggingface_hub import login
+
 drive.mount("/content/drive")
+login(userdata.get("HF_TOKEN"))
 ```
 
-Clone the repository:
+In another Colab cell, clone and install the project:
 
 ```bash
-!git clone YOUR_REPOSITORY_URL
-%cd inker-confidence-detector
-```
-
-Install dependencies:
-
-```bash
+!git clone https://github.com/TalaChehade/confidence-detector.git
+%cd confidence-detector
 !pip install -r requirements.txt
 ```
 
-## 2. Hugging Face authentication
+## 4. Add the dataset
 
-Store your Hugging Face token in Colab Secrets as `HF_TOKEN`.
-
-Then authenticate:
-
-```python
-from google.colab import userdata
-from huggingface_hub import login
-
-HF_TOKEN = userdata.get("HF_TOKEN")
-login(HF_TOKEN)
-```
-
-The experiment scripts can use the cached Hugging Face login. Alternatively:
-
-```python
-import os
-os.environ["HF_TOKEN"] = HF_TOKEN
-```
-
-Never commit your Hugging Face token to GitHub.
-
-## 3. Dataset setup
-
-Place:
+Obtain the dataset used by the original experiment and place the file at:
 
 ```text
-confidence_statements1.json
+/content/drive/MyDrive/INKER_Confidence_Detector/datasets/confidence_statements1.json
 ```
 
-at:
+For a local run, place it under the configured artifact root, for example:
 
 ```text
-/content/drive/MyDrive/INKER_Confidence_Detector/datasets/
+artifacts/datasets/confidence_statements1.json
 ```
 
-or modify `configs/default.yaml`.
+The file must contain the confidence statements expected by the dataset builder. See `data/README.md` for the data-location convention. The dataset is not generated by the experiment scripts, and private or restricted data should not be committed to GitHub.
 
-## 4. Configuration
+## 5. Configure the experiment
 
-The default experiment uses:
+All experiment scripts read `configs/default.yaml`. The default settings are:
 
-- model: `mistralai/Mistral-7B-Instruct-v0.1`
-- 4-bit quantization
-- layers 10 through 25
-- last-token representation (`rep_token=-1`)
-- one paired-difference operation
-- batch size 32
-- maximum input length 512
-- 512 training pairs
-- confidence threshold 0.5
-- deterministic generation
-- maximum 60 generated tokens
-- repetition penalty 1.1
+- model: `mistralai/Mistral-7B-Instruct-v0.1`;
+- 4-bit quantization with `float16` computation;
+- hidden layers 10 through 25;
+- last-token representation (`rep_token=-1`);
+- one paired-difference operation;
+- batch size 32 and maximum input length 512;
+- 512 training pairs;
+- confidence threshold 0.5;
+- maximum 60 generated tokens and repetition penalty 1.1;
+- deterministic experiment seed 0.
 
-All experiment scripts read these values from:
+The default artifact root is `/content/drive/MyDrive/INKER_Confidence_Detector`. For a local run, edit `paths.project_dir` in `configs/default.yaml` to a writable directory containing `datasets`, `models`, and `results` subdirectories.
 
-```text
-configs/default.yaml
-```
+## 6. Train the confidence detector
 
-## 5. Train the confidence detector
-
-Run:
+Run from the repository root:
 
 ```bash
-!python experiments/train_detector.py
+python experiments/train_detector.py
 ```
 
-This performs:
-
-1. dataset construction;
-2. training split creation;
-3. hidden-state extraction;
-4. paired differences;
-5. PCA independently for layers 10-25;
-6. sign correction;
-7. serialization of the representation reader.
-
-Output:
+Training constructs the dataset, creates the training split, extracts hidden states, computes paired differences, fits one PCA direction per layer, applies the label-based sign correction, and saves the reader here:
 
 ```text
-/content/drive/MyDrive/INKER_Confidence_Detector/
-models/inker_rep_reader.pkl
+<project_dir>/models/inker_rep_reader.pkl
 ```
 
-Training is required only when the representation reader does not already
-exist or when you intentionally change the training configuration.
+Training is needed when the reader does not exist or when the training configuration changes. It loads Mistral and may take substantial time and GPU memory.
 
-## 6. Evaluate the synthetic replication
+## 7. Evaluate the synthetic replication
 
-Run:
+Run after training:
 
 ```bash
-!python experiments/evaluate_detector.py
+python experiments/evaluate_detector.py
 ```
 
-This rebuilds the same deterministic dataset construction, loads the saved
-representation reader, and evaluates the eval/test splits.
-
-Metrics:
-
-- ROC-AUC
-- pairwise accuracy, where a pair is correct when
-  `score(confident) > score(unconfident)`
-- per-topic pairwise accuracy
+This rebuilds the deterministic dataset construction, loads the saved reader, and evaluates the eval and test splits. It reports ROC-AUC, pairwise accuracy (`score(confident) > score(unconfident)`), and per-topic behavior.
 
 Outputs:
 
 ```text
-results/replication/
-├── replication_metrics.csv
-├── eval_per_topic.csv
-└── test_per_topic.csv
+<project_dir>/results/replication/replication_metrics.csv
+<project_dir>/results/replication/eval_per_topic.csv
+<project_dir>/results/replication/test_per_topic.csv
 ```
 
-## 7. Run confidence-only generated-answer inference
+## 8. Run confidence-only inference
 
-Run:
+Run after the reader has been trained:
 
 ```bash
-!python experiments/run_confidence_only.py
+python experiments/run_confidence_only.py
 ```
 
-For each question, the model generates an answer, obtains a hidden state for
-every generated token, projects that state onto the learned confidence
-directions, averages layers, and applies causal normalization.
-
-The standalone confidence-only experiment defines:
-
-`confidence_i = m_tilde_i`.
-
-With the default threshold:
-
-- `confidence_i >= 0.5` -> confident
-- `confidence_i < 0.5` -> unconfident
-
-The question triggers when any content token is below the threshold.
+For each question, the model generates an answer, scores every generated token, averages layers 10 through 25, and applies causal normalization. A content token below the threshold causes the confidence-only trigger.
 
 Outputs:
 
 ```text
-results/confidence_only/
-├── confidence_only_questions.csv
-└── confidence_only_tokens.csv
+<project_dir>/results/confidence_only/confidence_only_questions.csv
+<project_dir>/results/confidence_only/confidence_only_tokens.csv
 ```
 
-## 8. Run the structured full-K test suite
+## 9. Run the full-K test suite
 
-Run:
+Run after the reader has been trained:
 
 ```bash
-!python experiments/run_test_suite.py
+python experiments/run_test_suite.py
 ```
 
-This uses:
-
-`K(t_i) = (E - m_tilde_i) * s_i`.
-
-It stores the model answer, expected answer when available, `E`,
-`mean_m_tilde`, `min_m_tilde`, `max_K`, the full-K trigger, and the original
-confidence-only comparison trigger.
+This stores the generated answer, expected answer where available, complexity proxy `E`, confidence statistics, full-K trigger, and confidence-only trigger.
 
 Outputs:
 
 ```text
-results/full_k/
-├── test_suite_questions.csv
-└── test_suite_tokens.csv
+<project_dir>/results/full_k/test_suite_questions.csv
+<project_dir>/results/full_k/test_suite_tokens.csv
 ```
 
-The `auto_correct` field is only a simple substring convenience check when an
-expected answer exists. It must not be treated as a robust semantic correctness
-metric in research conclusions.
+The `auto_correct` column is only a substring convenience check when an expected answer exists. It is not a robust semantic correctness metric.
 
-## 9. PCA formulation
+## 10. Run the complete workflow
 
-At layer `l`, the training procedure first constructs paired differences:
+After setup and authentication, run these commands in order:
 
-`Delta h_i^(l) = h_(2i)^(l) - h_(2i+1)^(l)`.
-
-Their mean is:
-
-`mu_l = (1/N) sum_i Delta h_i^(l)`.
-
-PCA is fitted to:
-
-`z_i^(l) = Delta h_i^(l) - mu_l`.
-
-The first principal component `v_l` maximizes projected variance:
-
-`v_l = argmax_(||v||=1) sum_i (z_i^(l) dot v)^2`.
-
-Because PCA direction sign is arbitrary, the training labels are used to choose
-`sign_l`. A new representation is scored as:
-
-`m_l(x) = sign_l * ((h_l(x) - mu_l) dot v_l)`.
-
-The final raw score is the average across layers:
-
-`m(x) = (1/|L|) sum_(l in L) m_l(x)`.
-
-See `docs/methodology.md` for the complete derivation and token-level equations.
-
-## 10. Causal normalization
-
-For token `i`, only scores from tokens `0...i` may be used.
-
-If the observed causal range is nonzero:
-
-`m_tilde_i = (m_i - min(m_0...m_i)) /
-             (max(m_0...m_i) - min(m_0...m_i))`.
-
-The first token, or an equal-valued window, receives `0.5`.
-
-This prevents future answer tokens from influencing the current token's
-normalized confidence.
-
-## 11. Replication caveat
-
-The repository currently contains two conceptually different parts:
-
-1. the paired-difference PCA confidence detector, reproduced from the original
-   experiment; and
-2. the query complexity term `E`, implemented with the original notebook's
-   rule-based proxy.
-
-The proxy is:
-
-`E = 0.5 * min(number_of_words / 25, 1)
-   + 0.5 * min(number_of_multihop_cues / 3, 1)`.
-
-This is not the trained T5-large Eva evaluator described by INKER. Therefore
-claims about complete INKER reproduction should be qualified accordingly.
-
-## 12. Results analysis
-
-After rerunning the cleaned implementation, add research results to:
-
-```text
-docs/results.md
+```bash
+python experiments/train_detector.py
+python experiments/evaluate_detector.py
+python experiments/run_confidence_only.py
+python experiments/run_test_suite.py
 ```
 
-The most important follow-up analysis is whether the confidence direction
-actually tracks factual correctness on generated answers rather than merely
-separating the synthetic confident/unconfident training styles.
+If `<project_dir>/models/inker_rep_reader.pkl` already exists, omit the first command. Each script also accepts an alternative configuration:
 
-That analysis should be performed only after the clean implementation is
-verified to reproduce the original experiment outputs.
+```bash
+python experiments/evaluate_detector.py --config configs/my_config.yaml
+```
+
+Use the same `--config` option for the other experiment scripts when needed.
+
+## 11. Understand the final results
+
+Inspect the result files in this order:
+
+1. `replication_metrics.csv`: confirms whether the learned direction separates synthetic confident and unconfident examples.
+2. `eval_per_topic.csv` and `test_per_topic.csv`: show topics with weak or unstable pairwise separation.
+3. `confidence_only_questions.csv` and its token file: show generated answers and causal normalized confidence values.
+4. `test_suite_questions.csv` and its token file: compare full-K and confidence-only decisions and inspect individual tokens.
+5. `docs/results.md`: record metrics, failure cases, configuration, and any conclusions after a run.
+
+The full-K results use the rule-based `E` proxy, not INKER's trained Eva evaluator. The `auto_correct` field is not a semantic factuality evaluator. Claims about complete end-to-end INKER reproduction must therefore be qualified.
+
+## Troubleshooting
+
+**`FileNotFoundError: Representation reader not found`**
+
+Run `train_detector.py` first, or update `paths.project_dir` so the configured `models/inker_rep_reader.pkl` path points to the trained reader.
+
+**CUDA out of memory**
+
+Reduce `detector.batch_size` or `detector.max_length`, or use a GPU with more memory. Record configuration changes with the results because they may affect runtime and outputs.
+
+**Hugging Face authentication or access errors**
+
+Run `hf auth whoami`, confirm model access, and authenticate again with `hf auth login`.
+
+**Missing dataset**
+
+Check the exact path in `configs/default.yaml` and confirm that `confidence_statements1.json` exists there.
+
+**Results differ between runs**
+
+The configured seed is `0`, but different PyTorch, CUDA, GPU, or dependency versions can still produce small numerical differences. Record the Python, PyTorch, Transformers, GPU, and configuration versions with each run.
+
+## Further documentation
+
+- `docs/methodology.md`: mathematical derivation of the detector and scoring.
+- `docs/replication.md`: what is preserved, what is intentionally unusual, and which parts are not exact INKER components.
+- `docs/results.md`: template for recording empirical results and analysis.
