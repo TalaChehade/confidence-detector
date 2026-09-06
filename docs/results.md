@@ -30,10 +30,17 @@ The INKER paper introduces Eva, a lightweight query complexity evaluator that es
 
 ### 2.5.1 What is Eva?
 
-Eva is a smaller language model (fine-tuned T5-Large with 0.77B parameters) trained to estimate a complexity score $E$ for a given query $Q$. The key properties are:
+Eva is a fine-tuned T5-Large model trained to estimate a complexity score $E$ for a given query $Q$. The key properties are:
 
-- **Model**: T5-Large (0.77B parameters), much smaller than the 7B+ generation models
-- **Training Data**: Open-source corpus that does NOT overlap with test queries
+- **Base Model**: T5-Large (0.77B parameters), much smaller than the 7B+ generation models
+- **Training Method**: Fine-tuned on open-source corpus that does NOT overlap with test queries
+- **Hyperparameters** (from INKER paper):
+  - Learning rate: 3e-5
+  - Max sequence length: 384
+  - Training batch size: 32
+  - Evaluation batch size: 100
+  - Optimizer: AdamW with weight decay 0.01
+  - Number of training epochs: 15
 - **Output**: Complexity score $E \in [0, 1]$ where:
   - Higher $E$ indicates more complex query, more likely to need retrieval
   - Lower $E$ indicates simpler query that the model can likely handle
@@ -45,8 +52,8 @@ The full INKER activation score combines query complexity with token-level confi
 $$K(t_i) = (E - m_{\tilde{i}}) \cdot s_i$$
 
 Where:
-- $E$ = Query complexity score (from Eva)
-- $m_{\tilde{i}}$ = Normalized confidence of token $i$ (from confidence detector)
+- $E$ = Query complexity score (from Eva, range [0,1])
+- $m_{\tilde{i}}$ = Normalized confidence of token $i$ (from confidence detector, range [0,1])
 - $s_i$ = Binary indicator: 1 if token is not a stop word, 0 if it is
 - $K(t_i)$ = Activation score for token $i$
 
@@ -60,7 +67,8 @@ Where:
 1. **Complexity-Aware**: Recognizes that simple queries don't need retrieval even with lower confidence
 2. **Static Metric**: Query complexity is computed once and reused for all tokens in the answer
 3. **Efficient**: Eva (0.77B) is much cheaper to run than the main LLM (7B+)
-4. **Open-Source Training**: Trained on publicly available data, making it reproducible
+4. **Reproducible**: Fine-tuned on publicly available data with explicit hyperparameters
+5. **Paper-Aligned**: Exact implementation of the INKER paper specifications
 
 ## 3. What the tests actually were
 

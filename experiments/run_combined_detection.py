@@ -3,13 +3,17 @@ Combined confidence detector + complexity evaluator experiment.
 
 This script runs the full INKER pipeline combining:
 1. Confidence detector (trained representation direction)
-2. Complexity evaluator (Eva - T5-Large based)
+2. Complexity evaluator (Eva - fine-tuned T5-Large)
 3. Activation score calculation: K(t_i) = (E - m_tilde_i) * s_i
 
 The activation score K(t_i) integrates query complexity E with token-level
 confidence m_tilde_i to determine whether retrieval is needed. A positive K
 indicates high activation (need for retrieval), while negative K indicates
 the model is confident in its generation.
+
+Requirements:
+- Trained confidence detector (from train_detector.py)
+- Fine-tuned Eva model (from train_complexity_evaluator.py)
 """
 
 import argparse
@@ -27,7 +31,7 @@ from _common import (
     detector_layers,
 )
 
-from inker.complexity import load_complexity_evaluator, estimate_complexity_proxy
+from inker.complexity import load_complexity_evaluator
 from inker.generation import answer_with_confidence
 
 
@@ -177,13 +181,13 @@ def print_summary(questions_df, tokens_df):
     print("\n" + "="*80 + "\n")
 
 
-def main(config_path=None, use_model=False, num_questions=None):
+def main(config_path=None, eva_model_path=None, num_questions=None):
     """
     Main experiment runner.
     
     Args:
         config_path: Path to config file
-        use_model: Use T5-Large model for complexity (else use rule-based proxy)
+        eva_model_path: Path to fine-tuned Eva model directory
         num_questions: Number of questions to evaluate (for testing)
     """
     config = get_config(config_path)
@@ -208,21 +212,30 @@ def main(config_path=None, use_model=False, num_questions=None):
         rep_reader = pickle.load(f)
     
     # Load complexity evaluator
-    print("Loading complexity evaluator...")
-    if use_model:
-        try:
-            complexity_fn = load_complexity_evaluator(use_proxy=False)
-            method = "T5-Large Eva Model"
-        except Exception as e:
-            print(f"Warning: Failed to load T5-Large model. Using rule-based proxy.")
-            print(f"Error: {e}")
-            complexity_fn = estimate_complexity_proxy
-            method = "Rule-based Proxy"
-    else:
-        complexity_fn = estimate_complexity_proxy
-        method = "Rule-based Proxy"
+    print("Loading complexity evaluator (Eva)...")
+    if eva_model_path is None:
+        raise ValueError(
+            "Eva model path is required. "
+            "Please provide path using --eva-model or train first:\n"
+            "  python experiments/train_complexity_evaluator.py <dataset.json>"
+        )
+    
+    if not os.path.exists(eva_model_path):
+        raise FileNotFoundError(
+            f"Eva model not found at: {eva_model_path}\n"
+            f"Please train the model first:\n"
+            f"  python experiments/train_complexity_evaluator.py <dataset.json>"
+        )
+    
+    try:
+        complexity_fn = load_complexity_evaluator(eva_model_path)
+        method = "Fine-tuned T5-Large Eva"
+    except Exception as e:
+        print(f"Error loading Eva model: {e}")
+        raise
     
     print(f"Using complexity evaluator: {method}")
+    print(f"  Model path: {eva_model_path}")
     
     # Load test questions
     print("Loading test questions...")
@@ -296,9 +309,10 @@ if __name__ == "__main__":
         help="Path to config file (default: configs/default.yaml)",
     )
     parser.add_argument(
-        "--use-model",
-        action="store_true",
-        help="Use T5-Large Eva model (default: use rule-based proxy)",
+        "--eva-model",
+        type=str,
+        required=True,
+        help="Path to fine-tuned Eva model directory (required)",
     )
     parser.add_argument(
         "--num-questions",
@@ -311,6 +325,6 @@ if __name__ == "__main__":
     
     main(
         config_path=args.config,
-        use_model=args.use_model,
+        eva_model_path=args.eva_model,
         num_questions=args.num_questions,
     )

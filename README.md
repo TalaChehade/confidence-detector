@@ -286,60 +286,87 @@ results/full_k/test_suite_questions.csv
 results/full_k/test_suite_tokens.csv
 ```
 
-## 11. Test the complexity evaluator (Eva)
+## 11. Train the complexity evaluator (Eva)
 
-The INKER paper uses a lightweight query complexity evaluator (Eva) that estimates how complex a query is. This is implemented as a fine-tuned T5-Large model trained on open-source data.
+The INKER paper uses a fine-tuned T5-Large model (Eva) that estimates query complexity. This model MUST be fine-tuned with specific hyperparameters from the paper before use.
 
-### 11.1 Quick test with rule-based proxy
+### 11.1 Prepare the training dataset
 
-To test the complexity evaluator using the rule-based proxy (no model download):
+Create a JSON file with training queries labeled by complexity level:
+
+```json
+{
+    "train": [
+        {"query": "What is the capital of France?", "complexity": 0},
+        {"query": "Compare photosynthesis and cellular respiration.", "complexity": 1},
+        {"query": "How does photosynthesis work?", "complexity": 0},
+        ...
+    ],
+    "validation": [
+        {"query": "What are the main causes of climate change?", "complexity": 1},
+        ...
+    ]
+}
+```
+
+**Important**: The training corpus must be from open-source data with **NO overlap** with your test queries.
+
+### 11.2 Train Eva with INKER paper hyperparameters
+
+Run the training script with your prepared dataset:
 
 ```bash
-!python experiments/test_complexity_evaluator.py --config configs/default.yaml
+!python experiments/train_complexity_evaluator.py path/to/complexity_dataset.json
 ```
 
-This evaluates complexity on a diverse set of simple, medium, and hard queries and saves results to:
+This trains Eva using the exact hyperparameters from the INKER paper:
+- Learning rate: 3e-5
+- Max sequence length: 384
+- Training batch size: 32
+- Evaluation batch size: 100
+- Optimizer: AdamW with weight decay 0.01
+- Number of epochs: 15
 
-```text
-results/complexity_eval/complexity_test_rule-based_proxy.csv
-```
-
-### 11.2 Test with T5-Large model (Eva)
-
-To test with the actual T5-Large model (requires model download):
+The trained model is saved to `models/eva` by default. You can specify a custom output directory:
 
 ```bash
-!python experiments/test_complexity_evaluator.py --config configs/default.yaml --use-model
+!python experiments/train_complexity_evaluator.py path/to/complexity_dataset.json --output-dir models/eva_custom
 ```
 
-This uses the fine-tuned T5-Large model to estimate query complexity $E$. The model estimates how likely a query is to require retrieval.
+### 11.3 Test the trained Eva model
 
-### 11.3 Test complexity evaluator with generation pipeline
-
-To integrate the complexity evaluator with token generation:
+After training, test the model on diverse queries:
 
 ```bash
-!python experiments/test_complexity_evaluator.py --config configs/default.yaml --with-generation
+!python experiments/test_complexity_evaluator.py --config configs/default.yaml --eva-model models/eva
 ```
-
-This generates answers to test queries and demonstrates how complexity scores $E$ work together with token-level confidence $m_{\tilde{i}}$ in the full pipeline.
 
 Results are saved to:
-
 ```text
-results/complexity_generation/generation_test_rule-based_proxy.csv (or with _t5_large_eva_model suffix)
+results/complexity_eval/complexity_test_fine-tuned_t5-large_eva.csv
 ```
+
+### 11.4 Test Eva with generation pipeline
+
+To see how Eva integrates with token generation:
+
+```bash
+!python experiments/test_complexity_evaluator.py --config configs/default.yaml --eva-model models/eva --with-generation
+```
+
+This generates answers to test queries and shows how complexity scores $E$ work with token-level confidence $m_{\tilde{i}}$.
 
 ## 12. Run combined confidence detector + complexity evaluator
 
-Run after training completes to execute the full INKER pipeline combining confidence detection with complexity evaluation:
+Run the full INKER pipeline after training both components:
 
 ```bash
-!python experiments/run_combined_detection.py --config configs/default.yaml
+!python experiments/run_combined_detection.py --config configs/default.yaml --eva-model models/eva
 ```
 
 This runs the complete INKER system:
-1. Estimates query complexity $E$ using Eva
+
+1. Estimates query complexity $E$ using the fine-tuned Eva model
 2. Scores each generated token for confidence $m_{\tilde{i}}$
 3. Computes activation score $K(t_i) = (E - m_{\tilde{i}}) \cdot s_i$ for each content token
 4. Triggers retrieval if any $K(t_i)$ exceeds threshold
@@ -358,23 +385,48 @@ Key columns in the results:
 - **would_trigger_full**: Whether full K method triggers
 - **would_trigger_confidence_only**: Whether confidence-only method triggers
 
-### 12.1 Using T5-Large Eva model
+### 12.1 Testing on subset of data
 
-To use the actual T5-Large model for complexity evaluation:
-
-```bash
-!python experiments/run_combined_detection.py --config configs/default.yaml --use-model
-```
-
-This loads and uses the fine-tuned T5-Large model for more accurate complexity estimation.
-
-### 12.2 Testing on subset of data
-
-To test on a smaller subset (useful for quick evaluation):
+To test on a smaller subset (useful for quick validation):
 
 ```bash
-!python experiments/run_combined_detection.py --config configs/default.yaml --num-questions 20
+!python experiments/run_combined_detection.py --config configs/default.yaml --eva-model models/eva --num-questions 20
 ```
+
+## Implementation Details
+
+### Complexity Score (E) Formula
+
+Eva predicts query complexity through binary classification (simple vs. complex):
+- **0.0 - 0.3**: Simple queries (fact retrieval, single-hop)
+- **0.3 - 0.6**: Medium complexity (requires some reasoning)
+- **0.6 - 1.0**: Complex queries (multi-hop, reasoning-heavy)
+
+### Activation Score (K) Formula
+
+$$K(t_i) = (E - m_{\tilde{i}}) \cdot s_i$$
+
+Where:
+- $E$ = Query complexity from Eva (0-1)
+- $m_{\tilde{i}}$ = Normalized token confidence (0-1)
+- $s_i$ = Content indicator (1 for non-stop-words, 0 otherwise)
+- $K(t_i)$ = Activation score for token i
+
+**Decision Rule**: Trigger retrieval if any content token has $K(t_i) > 0.5$
+
+### Eva Training Hyperparameters (from INKER paper)
+
+| Hyperparameter | Value |
+|---|---|
+| Base Model | T5-Large (0.77B parameters) |
+| Learning Rate | 3e-5 |
+| Max Sequence Length | 384 |
+| Document Stride | 128 |
+| Training Batch Size | 32 |
+| Evaluation Batch Size | 100 |
+| Optimizer | AdamW (weight decay: 0.01) |
+| Number of Epochs | 15 |
+| Evaluation Metric | F1 Score |
 
 ## Results Analysis
 

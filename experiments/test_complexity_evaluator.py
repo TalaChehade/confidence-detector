@@ -3,11 +3,14 @@ Test and validate the complexity evaluator (Eva).
 
 This script tests the query complexity evaluator which estimates a complexity
 score E for a given query. The complexity evaluator uses a fine-tuned T5-Large
-model trained on an open-source corpus that does not overlap with test queries.
+model trained with hyperparameters from the INKER paper.
 
 A higher complexity score indicates that the input query is more complex and is
 more likely to require retrieval. This serves as a static metric throughout the
 entire generation process.
+
+Before running this script, you must train the Eva model:
+    python experiments/train_complexity_evaluator.py <path_to_dataset.json>
 """
 
 import argparse
@@ -16,7 +19,7 @@ import pandas as pd
 import numpy as np
 
 from _common import get_config, resolve_project_path
-from inker.complexity import load_complexity_evaluator, estimate_complexity_proxy
+from inker.complexity import load_complexity_evaluator
 
 
 def get_test_queries():
@@ -50,32 +53,38 @@ def get_test_queries():
     ]
 
 
-def test_complexity_evaluator(config_path=None, use_model=False, verbose=True):
+def test_complexity_evaluator(config_path=None, eva_model_path=None, verbose=True):
     """
     Test the complexity evaluator on various queries.
     
     Args:
         config_path: Path to config file
-        use_model: If True, use the T5-Large model; otherwise use rule-based proxy
+        eva_model_path: Path to fine-tuned Eva model directory
         verbose: Print detailed results
     """
     config = get_config(config_path)
     
     # Load the complexity evaluator
-    if use_model:
-        try:
-            complexity_fn = load_complexity_evaluator(
-                use_proxy=False,
-            )
-            method = "T5-Large Eva Model"
-        except Exception as e:
-            print(f"Failed to load T5-Large model: {e}")
-            print("Falling back to rule-based proxy.")
-            complexity_fn = load_complexity_evaluator(use_proxy=True)
-            method = "Rule-based Proxy"
-    else:
-        complexity_fn = estimate_complexity_proxy
-        method = "Rule-based Proxy"
+    if eva_model_path is None:
+        raise ValueError(
+            "Eva model path is required. "
+            "Please provide path using --eva-model or train first:\n"
+            "  python experiments/train_complexity_evaluator.py <dataset.json>"
+        )
+    
+    if not os.path.exists(eva_model_path):
+        raise FileNotFoundError(
+            f"Eva model not found at: {eva_model_path}\n"
+            f"Please train the model first:\n"
+            f"  python experiments/train_complexity_evaluator.py <dataset.json>"
+        )
+    
+    try:
+        complexity_fn = load_complexity_evaluator(eva_model_path)
+        method = "Fine-tuned T5-Large Eva"
+    except Exception as e:
+        print(f"Error loading Eva model: {e}")
+        raise
     
     # Get test queries
     test_queries = get_test_queries()
@@ -134,7 +143,7 @@ def test_complexity_evaluator(config_path=None, use_model=False, verbose=True):
     return results_df
 
 
-def test_complexity_with_generation(config_path=None, use_model=False, verbose=True):
+def test_complexity_with_generation(config_path=None, eva_model_path=None, verbose=True):
     """
     Test complexity evaluator integrated with the generation pipeline.
     
@@ -160,18 +169,24 @@ def test_complexity_with_generation(config_path=None, use_model=False, verbose=T
         rep_reader = pickle.load(f)
     
     # Load complexity evaluator
-    if use_model:
-        try:
-            complexity_fn = load_complexity_evaluator(use_proxy=False)
-            method = "T5-Large Eva Model"
-        except Exception as e:
-            print(f"Failed to load T5-Large model: {e}")
-            print("Falling back to rule-based proxy.")
-            complexity_fn = estimate_complexity_proxy
-            method = "Rule-based Proxy"
-    else:
-        complexity_fn = estimate_complexity_proxy
-        method = "Rule-based Proxy"
+    if eva_model_path is None:
+        raise ValueError(
+            "Eva model path is required. "
+            "Please provide path using --eva-model or train first:\n"
+            "  python experiments/train_complexity_evaluator.py <dataset.json>"
+        )
+    
+    if not os.path.exists(eva_model_path):
+        raise FileNotFoundError(
+            f"Eva model not found at: {eva_model_path}"
+        )
+    
+    try:
+        complexity_fn = load_complexity_evaluator(eva_model_path)
+        method = "Fine-tuned T5-Large Eva"
+    except Exception as e:
+        print(f"Error loading Eva model: {e}")
+        raise
     
     # Test queries
     test_questions = [
@@ -242,9 +257,10 @@ def main():
         help="Path to config file (default: configs/default.yaml)",
     )
     parser.add_argument(
-        "--use-model",
-        action="store_true",
-        help="Use T5-Large model (default: use rule-based proxy)",
+        "--eva-model",
+        type=str,
+        required=True,
+        help="Path to fine-tuned Eva model directory (required)",
     )
     parser.add_argument(
         "--with-generation",
@@ -263,7 +279,7 @@ def main():
     # Test complexity evaluator alone
     test_complexity_evaluator(
         config_path=args.config,
-        use_model=args.use_model,
+        eva_model_path=args.eva_model,
         verbose=args.verbose,
     )
     
@@ -271,7 +287,7 @@ def main():
     if args.with_generation:
         test_complexity_with_generation(
             config_path=args.config,
-            use_model=args.use_model,
+            eva_model_path=args.eva_model,
             verbose=args.verbose,
         )
 
