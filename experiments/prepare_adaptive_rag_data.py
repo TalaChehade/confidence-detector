@@ -7,6 +7,7 @@ labels. This script only normalizes its ``binary_silver/train.json`` and
 
 import argparse
 import json
+import sys
 import tarfile
 import urllib.request
 from pathlib import Path
@@ -30,14 +31,25 @@ def extract_archive(archive, destination):
             target = (destination / member.name).resolve()
             if not target.is_relative_to(root):
                 raise ValueError(f"Unsafe path in archive: {member.name}")
-        tar.extractall(destination)
+        # ``filter`` is available in Python 3.12+. The explicit path check
+        # above protects older Colab runtimes while avoiding their warning.
+        if sys.version_info >= (3, 12):
+            tar.extractall(destination, filter="data")
+        else:
+            tar.extractall(destination)
 
 
-def find_single(root, suffix):
-    matches = list(root.rglob(suffix))
-    if len(matches) != 1:
-        raise FileNotFoundError(f"Expected exactly one {suffix} below {root}; found {matches}")
-    return matches[0]
+def find_label_file(root, label_source, split, kind):
+    path = (
+        root / "classifier" / "data" / "musique_hotpot_wiki2_nq_tqa_sqd"
+        / label_source / kind / f"{split}.json"
+    )
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"Official Adaptive-RAG {kind}/{split}.json for {label_source!r} "
+            f"not found at {path}"
+        )
+    return path
 
 
 def normalize_rows(path):
@@ -52,20 +64,29 @@ def normalize_rows(path):
     return normalized
 
 
-def main(data_root, output_path):
+def main(data_root, output_path, label_source="flan_t5_xl"):
     data_root, output_path = Path(data_root), Path(output_path)
-    train = normalize_rows(find_single(data_root, "binary_silver/train.json"))
-    validation = normalize_rows(find_single(data_root, "silver/valid.json"))
+    train = normalize_rows(find_label_file(data_root, label_source, "train", "binary_silver"))
+    validation = normalize_rows(find_label_file(data_root, label_source, "valid", "silver"))
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with open(output_path, "w", encoding="utf-8") as handle:
         json.dump({"train": train, "validation": validation}, handle, indent=2)
-    print(f"Wrote {len(train)} train and {len(validation)} validation Eva examples to {output_path}")
+    print(
+        f"Wrote {len(train)} train and {len(validation)} validation Eva examples "
+        f"from {label_source} labels to {output_path}"
+    )
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Prepare official Adaptive-RAG labels for Eva")
     parser.add_argument("--data-root", help="Directory where official data.tar.gz was extracted")
     parser.add_argument("--output", default="data/adaptive_rag_eva.json")
+    parser.add_argument(
+        "--label-source",
+        choices=("flan_t5_xl", "flan_t5_xxl", "gpt"),
+        default="flan_t5_xl",
+        help="Official generator whose silver labels train Eva (default: flan_t5_xl).",
+    )
     parser.add_argument("--download-to", help="Download the official archive to this path and extract it")
     parser.add_argument("--extract-to", default="data/adaptive_rag_official")
     args = parser.parse_args()
@@ -77,4 +98,4 @@ if __name__ == "__main__":
         data_root = Path(args.data_root)
     else:
         parser.error("provide --data-root, or --download-to (with optional --extract-to)")
-    main(data_root, args.output)
+    main(data_root, args.output, args.label_source)

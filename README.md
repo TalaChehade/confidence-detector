@@ -304,6 +304,11 @@ with a heuristic:
   --output data/adaptive_rag_eva.json
 ```
 
+The official archive has three generated-label sources. The default,
+`flan_t5_xl`, matches the original example; choose the label source that
+matches the generator used in your experiment with `--label-source gpt` or
+`--label-source flan_t5_xxl`.
+
 The archive is the official source and its train/dev queries must remain
 disjoint from the QA test queries used for the final experiment. The resulting
 JSON has Adaptive-RAG labels: `A` (no retrieval), `B` (single-step retrieval),

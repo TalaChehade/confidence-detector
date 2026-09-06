@@ -18,6 +18,10 @@ python experiments/prepare_adaptive_rag_data.py \
   --output data/adaptive_rag_eva.json
 ```
 
+By default this selects the official `flan_t5_xl` silver labels. Use
+`--label-source gpt` or `--label-source flan_t5_xxl` when Eva should match one
+of those generation models.
+
 Fine-tune T5-Large:
 
 ```bash
