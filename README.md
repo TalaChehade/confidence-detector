@@ -291,6 +291,10 @@ results/full_k/test_suite_tokens.csv
 
 The INKER paper uses a fine-tuned T5-Large model (Eva) that estimates query complexity. This model MUST be fine-tuned with specific hyperparameters from the paper before use.
 
+For a small hand-worked explanation of the encoder input, generated `A`/`B`/`C`
+target, cross-entropy loss, gradient accumulation, and conversion to `E`, see
+[How Eva is trained](docs/eva_training_explained.md).
+
 ### 11.1 Prepare the training dataset
 
 Download and normalize the official Adaptive-RAG generated-label archive. This
