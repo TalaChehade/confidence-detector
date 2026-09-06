@@ -357,6 +357,11 @@ This trains Eva using the exact hyperparameters from the INKER paper:
 - Optimizer: AdamW with weight decay 0.01
 - Number of epochs: 15
 
+On a Colab T4/L4-size GPU, the training command defaults to a physical batch
+of 1 with 32 gradient-accumulation steps, preserving the paper's effective
+training batch size of 32. It also enables gradient checkpointing. This avoids
+CUDA out-of-memory errors without changing the optimizer update batch.
+
 The trained model is saved to `models/eva` by default. You can specify a custom output directory:
 
 ```bash

@@ -7,6 +7,7 @@ the official inductive-bias labels (B for single-hop, C for multi-hop).
 
 import argparse
 import json
+import math
 import os
 import random
 
@@ -98,21 +99,48 @@ def compute_metrics(eval_pred, tokenizer):
     }
 
 
-def main(dataset_path, output_dir="models/eva", model_name=DEFAULT_MODEL_NAME, seed=42, hf_token=None):
+def main(
+    dataset_path,
+    output_dir="models/eva",
+    model_name=DEFAULT_MODEL_NAME,
+    seed=42,
+    hf_token=None,
+    train_micro_batch_size=1,
+    eval_micro_batch_size=4,
+    gradient_checkpointing=True,
+):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     dataset = load_dataset_from_json(dataset_path)
     tokenizer = AutoTokenizer.from_pretrained(model_name, token=hf_token)
     model = AutoModelForSeq2SeqLM.from_pretrained(model_name, token=hf_token)
+    if gradient_checkpointing:
+        # A T4-class 16 GB GPU cannot hold T5-Large with a physical batch of
+        # 32 at length 384. Checkpointing trades compute for activation memory.
+        model.gradient_checkpointing_enable()
+        model.config.use_cache = False
     processed = dataset.map(
         lambda batch: tokenize(batch, tokenizer), batched=True, remove_columns=dataset["train"].column_names
+    )
+    gradient_accumulation_steps = math.ceil(
+        INKER_HYPERPARAMETERS["train_batch_size"] / train_micro_batch_size
+    )
+    effective_train_batch_size = train_micro_batch_size * gradient_accumulation_steps
+    print(
+        "Eva batch configuration: "
+        f"micro-batch={train_micro_batch_size}, "
+        f"gradient accumulation={gradient_accumulation_steps}, "
+        f"effective train batch={effective_train_batch_size}; "
+        f"eval micro-batch={eval_micro_batch_size}"
     )
     args = Seq2SeqTrainingArguments(
         output_dir=output_dir,
         learning_rate=INKER_HYPERPARAMETERS["learning_rate"],
-        per_device_train_batch_size=INKER_HYPERPARAMETERS["train_batch_size"],
-        per_device_eval_batch_size=INKER_HYPERPARAMETERS["eval_batch_size"],
+        per_device_train_batch_size=train_micro_batch_size,
+        per_device_eval_batch_size=eval_micro_batch_size,
+        gradient_accumulation_steps=gradient_accumulation_steps,
+        gradient_checkpointing=gradient_checkpointing,
         weight_decay=INKER_HYPERPARAMETERS["weight_decay"],
         num_train_epochs=INKER_HYPERPARAMETERS["num_epochs"],
         eval_strategy="epoch", save_strategy="epoch", load_best_model_at_end=True,
@@ -140,5 +168,29 @@ if __name__ == "__main__":
     parser.add_argument("--output-dir", default="models/eva")
     parser.add_argument("--model", default=DEFAULT_MODEL_NAME)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--train-micro-batch-size", type=int, default=1,
+        help="Physical GPU batch size; gradient accumulation retains effective batch 32 (default: 1).",
+    )
+    parser.add_argument(
+        "--eval-micro-batch-size", type=int, default=4,
+        help="Physical GPU evaluation batch size for memory-limited runtimes (default: 4).",
+    )
+    parser.add_argument(
+        "--no-gradient-checkpointing", action="store_true",
+        help="Disable activation checkpointing; requires substantially more GPU memory.",
+    )
     args = parser.parse_args()
-    main(args.dataset, args.output_dir, args.model, args.seed)
+    if args.train_micro_batch_size < 1 or args.eval_micro_batch_size < 1:
+        parser.error("micro-batch sizes must be positive")
+    if INKER_HYPERPARAMETERS["train_batch_size"] % args.train_micro_batch_size:
+        parser.error("--train-micro-batch-size must divide the paper batch size (32)")
+    main(
+        args.dataset,
+        args.output_dir,
+        args.model,
+        args.seed,
+        train_micro_batch_size=args.train_micro_batch_size,
+        eval_micro_batch_size=args.eval_micro_batch_size,
+        gradient_checkpointing=not args.no_gradient_checkpointing,
+    )
