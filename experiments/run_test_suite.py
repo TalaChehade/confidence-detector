@@ -10,9 +10,7 @@ from _common import (
     detector_layers,
 )
 
-from inker.complexity import (
-    estimate_complexity_proxy,
-)
+from inker.complexity import load_complexity_evaluator
 
 from inker.generation import (
     answer_with_confidence,
@@ -110,8 +108,15 @@ TEST_SUITE = [
 ]
 
 
-def main(config_path=None):
+def main(config_path=None, eva_model_path=None):
     config = get_config(config_path)
+
+    if not eva_model_path:
+        raise ValueError(
+            "A fine-tuned Eva checkpoint is required. Run "
+            "train_complexity_evaluator.py, then pass --eva-model."
+        )
+    complexity_fn = load_complexity_evaluator(eva_model_path)
 
     reader_path = resolve_project_path(
         config,
@@ -150,8 +155,7 @@ def main(config_path=None):
             model=model,
             rep_reader=rep_reader,
             layers=detector_layers(config),
-            complexity_fn=
-                estimate_complexity_proxy,
+            complexity_fn=complexity_fn,
             threshold=threshold,
             max_new_tokens=config[
                 "generation"
@@ -266,5 +270,10 @@ if __name__ == "__main__":
         "--config",
         default=None,
     )
+    parser.add_argument(
+        "--eva-model",
+        required=True,
+        help="Path to the fine-tuned three-class Eva checkpoint.",
+    )
     args = parser.parse_args()
-    main(args.config)
+    main(args.config, args.eva_model)

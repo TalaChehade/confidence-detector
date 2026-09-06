@@ -276,10 +276,11 @@ results/confidence_only/confidence_only_tokens.csv
 Run after training completes and once you have the inker_rep_reader.pkl file saved:
 
 ```bash
-!python experiments/run_test_suite.py
+!python experiments/run_test_suite.py --eva-model models/eva
 ```
 
-This writes the generated answers, confidence statistics, complexity proxy `E`, full-K trigger, and confidence-only trigger:
+This writes the generated answers, confidence statistics, fine-tuned Eva
+complexity score `E`, full-K trigger, and confidence-only trigger:
 
 ```text
 results/full_k/test_suite_questions.csv
@@ -292,14 +293,38 @@ The INKER paper uses a fine-tuned T5-Large model (Eva) that estimates query comp
 
 ### 11.1 Prepare the training dataset
 
-Create a JSON file with training queries labeled by complexity level:
+Download and normalize the official Adaptive-RAG generated-label archive. This
+uses its silver labels plus its inductive-bias labels; it does not label queries
+with a heuristic:
+
+```bash
+!python experiments/prepare_adaptive_rag_data.py \
+  --download-to data/adaptive_rag_data.tar.gz \
+  --extract-to data/adaptive_rag_official \
+  --output data/adaptive_rag_eva.json
+```
+
+The archive is the official source and its train/dev queries must remain
+disjoint from the QA test queries used for the final experiment. The resulting
+JSON has Adaptive-RAG labels: `A` (no retrieval), `B` (single-step retrieval),
+and `C` (multi-step retrieval).
+
+For an already extracted official archive, use:
+
+```bash
+!python experiments/prepare_adaptive_rag_data.py \
+  --data-root data/adaptive_rag_official \
+  --output data/adaptive_rag_eva.json
+```
+
+Its normalized structure is:
 
 ```json
 {
     "train": [
-        {"query": "What is the capital of France?", "complexity": 0},
-        {"query": "Compare photosynthesis and cellular respiration.", "complexity": 1},
-        {"query": "How does photosynthesis work?", "complexity": 0},
+        {"question": "What is the capital of France?", "answer": "A"},
+        {"question": "Who wrote Hamlet and when?", "answer": "B"},
+        {"question": "Which country has a larger population, X or Y, and why?", "answer": "C"},
         ...
     ],
     "validation": [
@@ -316,7 +341,7 @@ Create a JSON file with training queries labeled by complexity level:
 Run the training script with your prepared dataset:
 
 ```bash
-!python experiments/train_complexity_evaluator.py path/to/complexity_dataset.json
+!python experiments/train_complexity_evaluator.py data/adaptive_rag_eva.json
 ```
 
 This trains Eva using the exact hyperparameters from the INKER paper:
@@ -397,10 +422,15 @@ To test on a smaller subset (useful for quick validation):
 
 ### Complexity Score (E) Formula
 
-Eva predicts query complexity through binary classification (simple vs. complex):
-- **0.0 - 0.3**: Simple queries (fact retrieval, single-hop)
-- **0.3 - 0.6**: Medium complexity (requires some reasoning)
-- **0.6 - 1.0**: Complex queries (multi-hop, reasoning-heavy)
+Eva is a fine-tuned T5-Large *generative* three-class classifier, matching
+Adaptive-RAG: `A` = no retrieval, `B` = single-step retrieval, and `C` =
+multi-step retrieval. It reports the static normalized expected complexity:
+
+$$E = 0\cdot P(A) + 0.5\cdot P(B) + 1\cdot P(C)$$
+
+Thus `E` is in `[0, 1]`, while the CSV exports retain the predicted class and
+all three probabilities for auditability. There is no heuristic
+`estimate_complexity_evaluator` or pre-trained fallback.
 
 ### Activation Score (K) Formula
 

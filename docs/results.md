@@ -228,6 +228,42 @@ Questions such as the last president of the United States are time-sensitive. Th
 
 Verbs that lack real information trigger low confidence scores and lead to retrieval even when unnecessary. Additionally, restating the question in the response flags the sentence as low confidence.
 
+## 6.4 Combined confidence detector + Eva (three-class Adaptive-RAG)
+
+This is a separate experiment from the confidence-only replication above. Its
+results must be generated only after Eva has been fine-tuned; the former
+heuristic complexity proxy is intentionally not used.
+
+Eva is a T5-Large model fine-tuned to generate Adaptive-RAG class `A` (no
+retrieval), `B` (single-step retrieval), or `C` (multi-step retrieval), using
+the official generated silver labels combined with inductive-bias labels. The
+exported static query score is:
+
+$$E = 0\cdot P(A) + 0.5\cdot P(B) + 1\cdot P(C).$$
+
+For each non-stop-word token, the combined run then calculates the paper's
+activation score without changing it:
+
+$$K(t_i) = (E - m_{\tilde{i}})\cdot s_i.$$
+
+Run the experiment with:
+
+```bash
+python experiments/run_combined_detection.py --eva-model models/eva
+```
+
+It writes `combined_questions.csv` and `combined_tokens.csv`. Report measured
+values—not placeholders—in this table after the run:
+
+| Run | Eva checkpoint | Questions | Mean E | Full-K trigger rate | Confidence-only trigger rate |
+|---|---|---:|---:|---:|---:|
+| Combined Eva + confidence detector | `models/eva` | pending | pending | pending | pending |
+
+The question-level export records `E`, `max_K`, and both trigger decisions;
+the evaluator test export additionally records predicted `A/B/C` and the three
+class probabilities. This keeps complexity routing distinct from factual-answer
+correctness and makes the result reproducible.
+
 ## 4.6 Combined complexity evaluator + confidence detector
 
 The INKER paper combines query complexity evaluation (Eva) with token-level confidence detection to produce activation scores $K(t_i)$.

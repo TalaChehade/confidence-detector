@@ -333,7 +333,7 @@ def answer_with_confidence(
 
     if verbose:
         print(f"Q: {question}")
-        print(f"E (complexity proxy): {E}")
+        print(f"E (Eva complexity score): {E:.4f}")
         print(f"A: {answer_text}\n")
 
         print(

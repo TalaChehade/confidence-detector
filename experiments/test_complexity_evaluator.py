@@ -98,18 +98,26 @@ def test_complexity_evaluator(config_path=None, eva_model_path=None, verbose=Tru
         print(f"{'='*80}\n")
     
     for query, expected_level in test_queries:
+        prediction = complexity_fn.predict(query)
         E = complexity_fn(query)
         
         results.append({
             "query": query,
             "expected_level": expected_level,
             "complexity_score_E": E,
+            "predicted_class": prediction["label"],
+            "p_A_no_retrieval": prediction["probabilities"]["A"],
+            "p_B_single_step": prediction["probabilities"]["B"],
+            "p_C_multi_step": prediction["probabilities"]["C"],
             "query_length": len(query.split()),
         })
         
         if verbose:
             print(f"Query: {query}")
-            print(f"Expected Level: {expected_level:>8} | Complexity Score E: {E:.4f}")
+            print(
+                f"Expected Level: {expected_level:>8} | Class: {prediction['label']} "
+                f"| Complexity Score E: {E:.4f}"
+            )
             print("-" * 80)
     
     # Create DataFrame for analysis
