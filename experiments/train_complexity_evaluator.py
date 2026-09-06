@@ -122,7 +122,7 @@ def main(dataset_path, output_dir="models/eva", model_name=DEFAULT_MODEL_NAME, s
     )
     trainer = Seq2SeqTrainer(
         model=model, args=args, train_dataset=processed["train"], eval_dataset=processed["validation"],
-        data_collator=DataCollatorForSeq2Seq(tokenizer, model=model), tokenizer=tokenizer,
+        data_collator=DataCollatorForSeq2Seq(tokenizer, model=model), processing_class=tokenizer,
         compute_metrics=lambda prediction: compute_metrics(prediction, tokenizer),
     )
     trainer.train()
