@@ -361,8 +361,9 @@ This trains Eva using the exact hyperparameters from the INKER paper:
 
 On a Colab T4/L4-size GPU, the training command defaults to a physical batch
 of 1 with 32 gradient-accumulation steps, preserving the paper's effective
-training batch size of 32. It also enables gradient checkpointing. This avoids
-CUDA out-of-memory errors without changing the optimizer update batch.
+training batch size of 32. It also enables gradient checkpointing. For
+numerical stability, it uses BF16 on supported GPUs and FP32 on T4 GPUs;
+do not force FP16 for T5-Large unless you have verified stable losses.
 
 The command saves the trained model to Google Drive, alongside the confidence
 detector reader, so it persists across Colab sessions. Reuse it instead of

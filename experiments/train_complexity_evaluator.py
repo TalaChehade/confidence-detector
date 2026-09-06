@@ -108,6 +108,7 @@ def main(
     train_micro_batch_size=1,
     eval_micro_batch_size=4,
     gradient_checkpointing=True,
+    mixed_precision="auto",
 ):
     random.seed(seed)
     np.random.seed(seed)
@@ -134,6 +135,16 @@ def main(
         f"effective train batch={effective_train_batch_size}; "
         f"eval micro-batch={eval_micro_batch_size}"
     )
+    bf16_available = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
+    if mixed_precision == "auto":
+        # Full T5-Large training often overflows in FP16 on T4 GPUs. Prefer
+        # BF16 where hardware supports it; otherwise use stable FP32 math.
+        mixed_precision = "bf16" if bf16_available else "none"
+    if mixed_precision == "bf16" and not bf16_available:
+        raise ValueError("BF16 was requested but this GPU does not support BF16")
+    use_fp16 = mixed_precision == "fp16"
+    use_bf16 = mixed_precision == "bf16"
+    print(f"Eva precision: {mixed_precision}")
     args = Seq2SeqTrainingArguments(
         output_dir=output_dir,
         learning_rate=INKER_HYPERPARAMETERS["learning_rate"],
@@ -146,7 +157,8 @@ def main(
         eval_strategy="epoch", save_strategy="epoch", load_best_model_at_end=True,
         metric_for_best_model="f1_macro", greater_is_better=True,
         predict_with_generate=True, generation_max_length=2,
-        fp16=torch.cuda.is_available(), seed=seed, logging_steps=50, report_to="none",
+        fp16=use_fp16, bf16=use_bf16, max_grad_norm=1.0,
+        seed=seed, logging_steps=50, report_to="none",
     )
     trainer = Seq2SeqTrainer(
         model=model, args=args, train_dataset=processed["train"], eval_dataset=processed["validation"],
@@ -180,6 +192,12 @@ if __name__ == "__main__":
         "--no-gradient-checkpointing", action="store_true",
         help="Disable activation checkpointing; requires substantially more GPU memory.",
     )
+    parser.add_argument(
+        "--mixed-precision",
+        choices=("auto", "none", "bf16", "fp16"),
+        default="auto",
+        help="Precision mode. auto uses BF16 when supported, otherwise stable FP32 (default: auto).",
+    )
     args = parser.parse_args()
     if args.train_micro_batch_size < 1 or args.eval_micro_batch_size < 1:
         parser.error("micro-batch sizes must be positive")
@@ -193,4 +211,5 @@ if __name__ == "__main__":
         train_micro_batch_size=args.train_micro_batch_size,
         eval_micro_batch_size=args.eval_micro_batch_size,
         gradient_checkpointing=not args.no_gradient_checkpointing,
+        mixed_precision=args.mixed_precision,
     )

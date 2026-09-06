@@ -36,7 +36,9 @@ stride reference `128`, batch sizes `32`/`100`, AdamW weight decay `0.01`, and
 
 For a 16 GB Colab GPU, use the defaults: physical train batch `1`, gradient
 accumulation `32` (effective training batch `32`), evaluation micro-batch `4`,
-and gradient checkpointing. These memory controls do not change the intended
+and gradient checkpointing. The default precision is BF16 when available,
+otherwise FP32; this avoids the `loss=inf`/`grad_norm=nan` FP16 overflow known
+to occur with T5-Large. These memory controls do not change the intended
 optimizer update batch size.
 
 At inference, it evaluates the first generated-token logits for `A`, `B`, and
