@@ -1,6 +1,8 @@
 paths:
   project_dir: "/content/drive/MyDrive/INKER_Confidence_Detector"
   dataset: "datasets/confidence_statements1.json"
+  eva_training_dataset: "datasets/adaptive_rag_eva.json"
+  eva_model: "models/eva"
   representation_reader: "models/inker_rep_reader.pkl"
   replication_results: "results/replication"
   confidence_only_results: "results/confidence_only"

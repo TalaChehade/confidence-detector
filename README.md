@@ -301,7 +301,7 @@ with a heuristic:
 !python experiments/prepare_adaptive_rag_data.py \
   --download-to data/adaptive_rag_data.tar.gz \
   --extract-to data/adaptive_rag_official \
-  --output data/adaptive_rag_eva.json
+  --output /content/drive/MyDrive/INKER_Confidence_Detector/datasets/adaptive_rag_eva.json
 ```
 
 The official archive has three generated-label sources. The default,
@@ -319,7 +319,7 @@ For an already extracted official archive, use:
 ```bash
 !python experiments/prepare_adaptive_rag_data.py \
   --data-root data/adaptive_rag_official \
-  --output data/adaptive_rag_eva.json
+  --output /content/drive/MyDrive/INKER_Confidence_Detector/datasets/adaptive_rag_eva.json
 ```
 
 Its normalized structure is:
@@ -346,7 +346,9 @@ Its normalized structure is:
 Run the training script with your prepared dataset:
 
 ```bash
-!python experiments/train_complexity_evaluator.py data/adaptive_rag_eva.json
+!python experiments/train_complexity_evaluator.py \
+  /content/drive/MyDrive/INKER_Confidence_Detector/datasets/adaptive_rag_eva.json \
+  --output-dir /content/drive/MyDrive/INKER_Confidence_Detector/models/eva
 ```
 
 This trains Eva using the exact hyperparameters from the INKER paper:
@@ -362,10 +364,14 @@ of 1 with 32 gradient-accumulation steps, preserving the paper's effective
 training batch size of 32. It also enables gradient checkpointing. This avoids
 CUDA out-of-memory errors without changing the optimizer update batch.
 
-The trained model is saved to `models/eva` by default. You can specify a custom output directory:
+The command saves the trained model to Google Drive, alongside the confidence
+detector reader, so it persists across Colab sessions. Reuse it instead of
+training again. You can specify a different persistent output directory:
 
 ```bash
-!python experiments/train_complexity_evaluator.py path/to/complexity_dataset.json --output-dir models/eva_custom
+!python experiments/train_complexity_evaluator.py \
+  /content/drive/MyDrive/INKER_Confidence_Detector/datasets/adaptive_rag_eva.json \
+  --output-dir /content/drive/MyDrive/INKER_Confidence_Detector/models/eva_custom
 ```
 
 ### 11.3 Test the trained Eva model
@@ -373,7 +379,8 @@ The trained model is saved to `models/eva` by default. You can specify a custom 
 After training, test the model on diverse queries:
 
 ```bash
-!python experiments/test_complexity_evaluator.py --config configs/default.yaml --eva-model models/eva
+!python experiments/test_complexity_evaluator.py --config configs/default.yaml \
+  --eva-model /content/drive/MyDrive/INKER_Confidence_Detector/models/eva
 ```
 
 Results are saved to:
@@ -386,7 +393,8 @@ results/complexity_eval/complexity_test_fine-tuned_t5-large_eva.csv
 To see how Eva integrates with token generation:
 
 ```bash
-!python experiments/test_complexity_evaluator.py --config configs/default.yaml --eva-model models/eva --with-generation
+!python experiments/test_complexity_evaluator.py --config configs/default.yaml \
+  --eva-model /content/drive/MyDrive/INKER_Confidence_Detector/models/eva --with-generation
 ```
 
 This generates answers to test queries and shows how complexity scores $E$ work with token-level confidence $m_{\tilde{i}}$.
@@ -396,7 +404,8 @@ This generates answers to test queries and shows how complexity scores $E$ work 
 Run the full INKER pipeline after training both components:
 
 ```bash
-!python experiments/run_combined_detection.py --config configs/default.yaml --eva-model models/eva
+!python experiments/run_combined_detection.py --config configs/default.yaml \
+  --eva-model /content/drive/MyDrive/INKER_Confidence_Detector/models/eva
 ```
 
 This runs the complete INKER system:
