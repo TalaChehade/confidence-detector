@@ -7,6 +7,7 @@ This report analyses the result files produced by the recent experiments. The fi
 1. A small **confidence-only demonstration** using three factual questions.
 2. A 13-example **test suite** comparing a full-K decision rule with a confidence-only decision rule.
 3. A broader **replication experiment** reporting ROC AUC and pairwise accuracy on evaluation and test splits, including topic-level breakdowns.
+4. **Complexity evaluator experiments** combining the confidence detector with a query complexity evaluator (Eva) to produce activation scores.
 
 The analysis describes what was tested, what the reported values show, where the evidence is incomplete, and how the next experimental iteration could make the conclusions stronger.
 
@@ -19,8 +20,47 @@ A key distinction is necessary throughout: a trigger indicates that the method c
 | Confidence-only demonstration | `confidence_only_questions.csv`, `confidence_only_tokens.csv` | Examine token-level confidence and aggregate confidence for three factual answers. |
 | Full test suite | `test_suite_questions.csv`, `test_suite_tokens.csv` | Compare full-K and confidence-only trigger decisions across deliberately varied question types. |
 | Replication benchmark | `replication_metrics.csv`, `eval_per_topic.csv`, `test_per_topic.csv` | Measure how well the replicated scoring method separates paired examples overall and by topic. |
+| Combined detection | `combined_questions.csv`, `combined_tokens.csv` | Full INKER pipeline: confidence detector + complexity evaluator with activation scores. |
 
 The token files provide intermediate evidence for the question-level decisions. Punctuation, stop words, and end-of-sequence tokens are now filtered before scoring: they are marked `SKIP`, have `is_content=False`, and have blank score fields. This is intentional and should not be treated as missing model output. The filtering also normalizes tokenizer markers such as `▁` before identifying stop words.
+
+## 2.5 The Complexity Evaluator (Eva)
+
+The INKER paper introduces Eva, a lightweight query complexity evaluator that estimates how complex a query is and whether it likely requires retrieval augmentation. This is a fundamental component of the full INKER system.
+
+### 2.5.1 What is Eva?
+
+Eva is a smaller language model (fine-tuned T5-Large with 0.77B parameters) trained to estimate a complexity score $E$ for a given query $Q$. The key properties are:
+
+- **Model**: T5-Large (0.77B parameters), much smaller than the 7B+ generation models
+- **Training Data**: Open-source corpus that does NOT overlap with test queries
+- **Output**: Complexity score $E \in [0, 1]$ where:
+  - Higher $E$ indicates more complex query, more likely to need retrieval
+  - Lower $E$ indicates simpler query that the model can likely handle
+
+### 2.5.2 How Eva integrates with the confidence detector
+
+The full INKER activation score combines query complexity with token-level confidence:
+
+$$K(t_i) = (E - m_{\tilde{i}}) \cdot s_i$$
+
+Where:
+- $E$ = Query complexity score (from Eva)
+- $m_{\tilde{i}}$ = Normalized confidence of token $i$ (from confidence detector)
+- $s_i$ = Binary indicator: 1 if token is not a stop word, 0 if it is
+- $K(t_i)$ = Activation score for token $i$
+
+**Interpretation**:
+- Positive $K(t_i)$ indicates the token needs attention (high complexity, low confidence)
+- Negative $K(t_i)$ indicates the token is reliable (low complexity or high confidence)
+- A trigger occurs if ANY content token has $K(t_i) > \text{threshold}$
+
+### 2.5.3 Advantages over confidence-only approach
+
+1. **Complexity-Aware**: Recognizes that simple queries don't need retrieval even with lower confidence
+2. **Static Metric**: Query complexity is computed once and reused for all tokens in the answer
+3. **Efficient**: Eva (0.77B) is much cheaper to run than the main LLM (7B+)
+4. **Open-Source Training**: Trained on publicly available data, making it reproducible
 
 ## 3. What the tests actually were
 
@@ -180,7 +220,54 @@ Questions such as the last president of the United States are time-sensitive. Th
 
 Verbs that lack real information trigger low confidence scores and lead to retrieval even when unnecessary. Additionally, restating the question in the response flags the sentence as low confidence.
 
-## 7. Recommended future approach
+## 4.6 Combined complexity evaluator + confidence detector
+
+The INKER paper combines query complexity evaluation (Eva) with token-level confidence detection to produce activation scores $K(t_i)$.
+
+### 4.6.1 Method
+
+The combined method operates in three stages:
+
+1. **Query Complexity Evaluation (Eva)**: A fine-tuned T5-Large model estimates complexity score $E \in [0, 1]$ for the input query
+2. **Token-Level Confidence**: The trained representation direction scores each generated token, producing normalized confidence $m_{\tilde{i}}$
+3. **Activation Score**: Integration via $K(t_i) = (E - m_{\tilde{i}}) \cdot s_i$ where $s_i$ is 1 for non-stop-words
+
+### 4.6.2 Advantages over confidence-only
+
+The combined approach addresses key limitations of confidence-only:
+
+- **Complexity-aware thresholding**: Simple queries trigger less often, even with lower confidence
+- **Static metric**: Query complexity is computed once, independent of generation
+- **Efficient**: Eva (0.77B) is orders of magnitude smaller than generation LLMs (7B+)
+- **Aligned with INKER paper**: This is the exact method proposed in the original research
+
+### 4.6.3 Results interpretation
+
+Results from combined detection experiments are saved in:
+- `combined_questions.csv`: Question-level results including $E$, mean $m_{\tilde{i}}$, max $K(t_i)$, and trigger decisions
+- `combined_tokens.csv`: Token-level details for inspection and analysis
+
+Key metrics in question-level results:
+
+| Metric | Meaning |
+|--------|---------|
+| `E` | Query complexity score (0=simple, 1=complex) |
+| `mean_m_tilde` | Average token confidence for content tokens |
+| `min_m_tilde` | Minimum token confidence (lowest confidence token) |
+| `max_K` | Maximum activation score among all content tokens |
+| `would_trigger_full` | Does any token exceed K threshold? (Full K method) |
+| `would_trigger_confidence_only` | Does any token have (1-m_tilde) > threshold? (Confidence-only) |
+
+**Expected patterns**:
+
+- High-complexity queries have large $E$ values, raising $K$ scores
+- Simple queries have small $E$ values, suppressing triggers even with moderate confidence
+- Multihop or reasoning queries typically show higher $E$ and more triggering
+- Named entities and key facts typically have higher confidence ($m_{\tilde{i}} > 0.5$), yielding lower or negative $K$
+
+## 5. Main interpretation
+
+Taken together, the results support four guarded conclusions:
 
 ### 7.1 Reduce tokenization artefacts
 

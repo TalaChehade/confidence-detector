@@ -5,6 +5,8 @@ paths:
   replication_results: "results/replication"
   confidence_only_results: "results/confidence_only"
   full_k_results: "results/full_k"
+  complexity_eval_results: "results/complexity_eval"
+  complexity_generation_results: "results/complexity_generation"
   logs: "logs"
 
 model:

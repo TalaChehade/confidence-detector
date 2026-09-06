@@ -286,5 +286,95 @@ results/full_k/test_suite_questions.csv
 results/full_k/test_suite_tokens.csv
 ```
 
+## 11. Test the complexity evaluator (Eva)
+
+The INKER paper uses a lightweight query complexity evaluator (Eva) that estimates how complex a query is. This is implemented as a fine-tuned T5-Large model trained on open-source data.
+
+### 11.1 Quick test with rule-based proxy
+
+To test the complexity evaluator using the rule-based proxy (no model download):
+
+```bash
+!python experiments/test_complexity_evaluator.py --config configs/default.yaml
+```
+
+This evaluates complexity on a diverse set of simple, medium, and hard queries and saves results to:
+
+```text
+results/complexity_eval/complexity_test_rule-based_proxy.csv
+```
+
+### 11.2 Test with T5-Large model (Eva)
+
+To test with the actual T5-Large model (requires model download):
+
+```bash
+!python experiments/test_complexity_evaluator.py --config configs/default.yaml --use-model
+```
+
+This uses the fine-tuned T5-Large model to estimate query complexity $E$. The model estimates how likely a query is to require retrieval.
+
+### 11.3 Test complexity evaluator with generation pipeline
+
+To integrate the complexity evaluator with token generation:
+
+```bash
+!python experiments/test_complexity_evaluator.py --config configs/default.yaml --with-generation
+```
+
+This generates answers to test queries and demonstrates how complexity scores $E$ work together with token-level confidence $m_{\tilde{i}}$ in the full pipeline.
+
+Results are saved to:
+
+```text
+results/complexity_generation/generation_test_rule-based_proxy.csv (or with _t5_large_eva_model suffix)
+```
+
+## 12. Run combined confidence detector + complexity evaluator
+
+Run after training completes to execute the full INKER pipeline combining confidence detection with complexity evaluation:
+
+```bash
+!python experiments/run_combined_detection.py --config configs/default.yaml
+```
+
+This runs the complete INKER system:
+1. Estimates query complexity $E$ using Eva
+2. Scores each generated token for confidence $m_{\tilde{i}}$
+3. Computes activation score $K(t_i) = (E - m_{\tilde{i}}) \cdot s_i$ for each content token
+4. Triggers retrieval if any $K(t_i)$ exceeds threshold
+
+Results are saved to:
+
+```text
+results/full_k/combined_questions.csv
+results/full_k/combined_tokens.csv
+```
+
+Key columns in the results:
+- **E**: Query complexity score (0=simple, 1=complex)
+- **mean_m_tilde**: Average token confidence for content tokens
+- **max_K**: Maximum activation score among tokens
+- **would_trigger_full**: Whether full K method triggers
+- **would_trigger_confidence_only**: Whether confidence-only method triggers
+
+### 12.1 Using T5-Large Eva model
+
+To use the actual T5-Large model for complexity evaluation:
+
+```bash
+!python experiments/run_combined_detection.py --config configs/default.yaml --use-model
+```
+
+This loads and uses the fine-tuned T5-Large model for more accurate complexity estimation.
+
+### 12.2 Testing on subset of data
+
+To test on a smaller subset (useful for quick evaluation):
+
+```bash
+!python experiments/run_combined_detection.py --config configs/default.yaml --num-questions 20
+```
+
 ## Results Analysis
 
