@@ -1,38 +1,257 @@
+# =============================================================================
+# INKER Confidence Detector / IE-KRT Replication Configuration
+# =============================================================================
+#
+# This file is the central configuration for:
+#
+#   - confidence-detector training,
+#   - confidence-detector evaluation,
+#   - confidence-only generation,
+#   - Adaptive-RAG complexity evaluation,
+#   - and the live INKER IE-KRT retrieval trigger.
+#
+# Keep training and evaluation settings synchronized through this file rather
+# than hard-coding values independently inside experiment scripts.
+# =============================================================================
+
+
+# =============================================================================
+# Project paths
+# =============================================================================
+
 paths:
+
+  # Root directory used when running the repository in Google Colab.
   project_dir: "/content/drive/MyDrive/INKER_Confidence_Detector"
+
+  # INKER / CtrlA-style confident-vs-unconfident statement dataset used for
+  # training the internal confidence representation detector.
   dataset: "datasets/confidence_statements1.json"
-  eva_training_dataset: "datasets/adaptive_rag_eva.json"
-  eva_model: "models/eva"
+
+  # Trained representation reader produced by:
+  #
+  #   experiments/train_detector.py
+  #
   representation_reader: "models/inker_rep_reader.pkl"
+
+  # Offline confidence-detector replication metrics.
   replication_results: "results/replication"
+
+  # Confidence-only generation baseline.
   confidence_only_results: "results/confidence_only"
+
+  # Full IE-KRT activation / trigger experiments.
   full_k_results: "results/full_k"
+
+  # Standalone Adaptive-RAG complexity-evaluator tests.
   complexity_eval_results: "results/complexity_eval"
-  complexity_generation_results: "results/complexity_generation"
+
+  # General logs.
   logs: "logs"
 
+
+# =============================================================================
+# Base language model
+# =============================================================================
+
 model:
+
+  # Base LLM used by the INKER confidence detector replication.
   name: "mistralai/Mistral-7B-Instruct-v0.1"
+
+  # Load Mistral with BitsAndBytes 4-bit quantization.
   load_in_4bit: true
+
+  # FP16 is retained for consistency with the existing replication setup.
   compute_dtype: "float16"
+
+  # Nested / double quantization.
   use_double_quant: true
+
+  # BitsAndBytes 4-bit quantization type.
+  quant_type: "nf4"
+
+  # Required when rep_token = -1 so the last tensor position corresponds to
+  # the final real token for every sequence in a padded batch.
   padding_side: "left"
+
+  # Mistral replication setting used by the existing implementation.
   pad_token_id: 0
 
+  # Let Transformers / Accelerate place the model automatically.
+  device_map: "auto"
+
+
+# =============================================================================
+# Confidence representation detector
+# =============================================================================
+
 detector:
-  hidden_layers: [10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25]
+
+  # INKER Appendix-B-style detector layers.
+  #
+  # Inclusive range:
+  #   10, 11, ..., 25
+  #
+  # Total = 16 hidden layers.
+  hidden_layers:
+    - 10
+    - 11
+    - 12
+    - 13
+    - 14
+    - 15
+    - 16
+    - 17
+    - 18
+    - 19
+    - 20
+    - 21
+    - 22
+    - 23
+    - 24
+    - 25
+
+  # Hidden representation position.
+  #
+  # With left padding:
+  #   -1 = last real token.
   rep_token: -1
+
+  # One confident-vs-unconfident difference vector per pair.
+  #
+  # The current replication requires:
+  #   n_difference = 1
   n_difference: 1
+
+  # Hidden-state extraction batch size.
   batch_size: 32
+
+  # Maximum sequence length used during detector training/evaluation.
   max_length: 512
-  n_train: 512
+
+
+# =============================================================================
+# Train / evaluation split
+# =============================================================================
+#
+# train_detector.py and evaluate_detector.py MUST use the same ratios and seed.
+# =============================================================================
+
+split:
+
+  train_ratio: 0.70
+  eval_ratio: 0.15
+  test_ratio: 0.15
+
+
+# =============================================================================
+# External query-complexity evaluator
+# =============================================================================
+#
+# Primary replication uses the pretrained third-party Adaptive-RAG
+# reproduction rather than retraining T5-Large from scratch.
+#
+# The original INKER implementation details are not sufficient to reproduce
+# an exact continuous conversion from A/B/C into E, so the mapping below is
+# explicitly treated as a replication assumption.
+# =============================================================================
+
+complexity:
+
+  # Pretrained Adaptive-RAG-style T5-Large reproduction.
+  model_name: "LenckCuak/Adaptive-RAG"
+
+  # Input-length limit used by the T5 evaluator.
+  max_input_length: 384
+
+  # Replication assumption:
+  #
+  #   A = no retrieval        -> 0.0
+  #   B = single retrieval    -> 0.5
+  #   C = multi-step retrieval -> 1.0
+  #
+  label_values:
+    A: 0.0
+    B: 0.5
+    C: 1.0
+
+  # Continuous external complexity:
+  #
+  #   E = 0.0 * P(A)
+  #       + 0.5 * P(B)
+  #       + 1.0 * P(C)
+  #
+  #     = 0.5 * P(B) + P(C)
+  #
+  score_method: "probability_weighted_ordinal"
+
+
+# =============================================================================
+# Generation
+# =============================================================================
 
 generation:
+
+  # Maximum number of tokens generated for experiments that do not stop
+  # earlier because of an IE-KRT retrieval trigger.
   max_new_tokens: 60
+
+  # Repetition penalty used during generation.
   repetition_penalty: 1.1
 
+
+# =============================================================================
+# Confidence-only baseline
+# =============================================================================
+#
+# A content token is considered low-confidence when:
+#
+#   m_tilde_i < confidence.threshold
+#
+# This threshold is conceptually independent from the INKER K threshold.
+# =============================================================================
+
 confidence:
+
   threshold: 0.5
 
+
+# =============================================================================
+# INKER IE-KRT retrieval trigger
+# =============================================================================
+#
+# For every generated token:
+#
+#   K(t_i) = (E - m_tilde_i) * s_i
+#
+# Retrieval is triggered when:
+#
+#   K(t_i) > trigger.threshold
+# =============================================================================
+
+trigger:
+
+  threshold: 0.5
+
+  # In live IE-KRT testing, stop immediately when the first trigger occurs.
+  #
+  # This lets us identify the exact point at which retrieval would be invoked.
+  stop_on_trigger: true
+
+
+# =============================================================================
+# Experiment reproducibility
+# =============================================================================
+
 experiment:
+
+  # Used consistently for:
+  #
+  #   - Python random
+  #   - NumPy
+  #   - PyTorch
+  #   - pair construction
+  #   - dataset splitting
+  #
   seed: 0
