@@ -98,7 +98,7 @@ from inker.dataset import (
     make_split,
 )
 
-from inker.direction import (
+from inker.directions import (
     get_directions,
 )
 
