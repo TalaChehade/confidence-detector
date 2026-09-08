@@ -1618,4 +1618,3 @@ def answer_with_confidence_only(
     ]
 
     return result
-```
