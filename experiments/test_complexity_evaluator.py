@@ -1,303 +1,706 @@
 """
-Test and validate the complexity evaluator (Eva).
+Test the Adaptive-RAG-style query complexity evaluator.
 
-This script tests the query complexity evaluator which estimates a complexity
-score E for a given query. The complexity evaluator uses a fine-tuned T5-Large
-model trained with hyperparameters from the INKER paper.
+This experiment evaluates ONLY the external query-complexity component used by
+the INKER IE-KRT replication.
 
-A higher complexity score indicates that the input query is more complex and is
-more likely to require retrieval. This serves as a static metric throughout the
-entire generation process.
+The evaluator predicts one of the Adaptive-RAG retrieval-complexity classes:
 
-Before running this script, you must train the Eva model:
-    python experiments/train_complexity_evaluator.py <path_to_dataset.json>
+    A = no retrieval
+    B = single-step retrieval
+    C = multi-step / iterative retrieval
+
+The replication then converts the class probabilities into a continuous
+external complexity score:
+
+    A -> 0.0
+    B -> 0.5
+    C -> 1.0
+
+and defines:
+
+    E = 0.0 * P(A)
+        + 0.5 * P(B)
+        + 1.0 * P(C)
+
+therefore:
+
+    E = 0.5 * P(B) + P(C)
+
+Purpose
+-------
+This file is a component-level sanity check.
+
+It answers questions such as:
+
+    - Does the Adaptive-RAG reproduction load correctly?
+    - What class does it predict for simple and difficult queries?
+    - Are P(A), P(B), and P(C) sensible?
+    - Does the continuous replication score E increase for queries that
+      appear to require more retrieval/reasoning?
+
+Important
+---------
+The manually assigned labels:
+
+    low
+    medium
+    high
+
+in this script are qualitative expectations created for diagnostic purposes.
+
+They are NOT official Adaptive-RAG labels and should NOT be reported as
+ground-truth benchmark annotations.
+
+This script intentionally does NOT run Mistral generation or the confidence
+detector. Full integration is tested separately by:
+
+    experiments/run_inker_trigger.py
+    experiments/run_test_suite.py
 """
 
+from __future__ import annotations
+
 import argparse
-import os
-import pandas as pd
+from pathlib import Path
+from typing import Dict, List
+
 import numpy as np
+import pandas as pd
 
-from _common import get_config, resolve_project_path
-from inker.complexity import load_complexity_evaluator
+from _common import (
+    get_config,
+    get_project_path,
+)
+
+from inker.complexity import (
+    AdaptiveRAGComplexityEvaluator,
+    DEFAULT_ADAPTIVE_RAG_MODEL,
+)
 
 
-def get_test_queries():
+# ==========================================================================
+# Qualitative sanity-check queries
+# ==========================================================================
+
+TEST_QUERIES = [
+    # ------------------------------------------------------------------
+    # Lower expected retrieval complexity
+    # ------------------------------------------------------------------
+    {
+        "query":
+            "What is the capital of France?",
+
+        "expected_level":
+            "low",
+
+        "notes":
+            "Simple factual question likely answerable parametrically.",
+    },
+    {
+        "query":
+            "Who wrote Romeo and Juliet?",
+
+        "expected_level":
+            "low",
+
+        "notes":
+            "Simple well-known factual question.",
+    },
+    {
+        "query":
+            "What is 2 + 2?",
+
+        "expected_level":
+            "low",
+
+        "notes":
+            "Very simple arithmetic.",
+    },
+    {
+        "query":
+            "What color is the sky?",
+
+        "expected_level":
+            "low",
+
+        "notes":
+            "Simple general-knowledge question.",
+    },
+
+    # ------------------------------------------------------------------
+    # Medium expected retrieval complexity
+    # ------------------------------------------------------------------
+    {
+        "query":
+            "How do plants perform photosynthesis?",
+
+        "expected_level":
+            "medium",
+
+        "notes":
+            "Explanatory question requiring multiple related facts.",
+    },
+    {
+        "query":
+            "What are the causes of climate change?",
+
+        "expected_level":
+            "medium",
+
+        "notes":
+            "Broad explanatory question with several contributing factors.",
+    },
+    {
+        "query":
+            "Explain the theory of evolution.",
+
+        "expected_level":
+            "medium",
+
+        "notes":
+            "Conceptual explanation rather than a single factual lookup.",
+    },
+    {
+        "query":
+            "Describe the water cycle.",
+
+        "expected_level":
+            "medium",
+
+        "notes":
+            "Multi-stage explanatory process.",
+    },
+
+    # ------------------------------------------------------------------
+    # Higher expected retrieval / reasoning complexity
+    # ------------------------------------------------------------------
+    {
+        "query":
+            "Who was the first president of the United States "
+            "and what were his major achievements?",
+
+        "expected_level":
+            "high",
+
+        "notes":
+            "Requires entity identification plus additional information.",
+    },
+    {
+        "query":
+            "Compare and contrast the causes of World War I "
+            "and World War II.",
+
+        "expected_level":
+            "high",
+
+        "notes":
+            "Requires retrieving and comparing multiple sets of facts.",
+    },
+    {
+        "query":
+            "How does the greenhouse effect contribute to climate change "
+            "and what are the long-term consequences?",
+
+        "expected_level":
+            "high",
+
+        "notes":
+            "Multi-part causal question.",
+    },
+    {
+        "query":
+            "Explain the relationship between supply and demand in economics "
+            "and how it affects market prices.",
+
+        "expected_level":
+            "high",
+
+        "notes":
+            "Requires explaining a relationship and its consequences.",
+    },
+]
+
+
+# ==========================================================================
+# Helpers
+# ==========================================================================
+
+def qualitative_level_to_rank(
+    level: str,
+) -> int:
     """
-    Get a diverse set of test queries for complexity evaluation.
-    
-    Returns:
-        List of tuples: (query, expected_complexity_level)
+    Map qualitative diagnostic labels to an ordinal rank.
+
+    This mapping exists ONLY for summary statistics.
+
+        low    -> 0
+        medium -> 1
+        high   -> 2
+
+    It must not be confused with the Adaptive-RAG A/B/C labels.
     """
-    return [
-        # Simple queries (low complexity)
-        ("What is the capital of France?", "low"),
-        ("Who wrote Romeo and Juliet?", "low"),
-        ("What is 2 + 2?", "low"),
-        ("What color is the sky?", "low"),
-        ("Is water wet?", "low"),
-        
-        # Medium complexity queries
-        ("How do plants perform photosynthesis?", "medium"),
-        ("What are the causes of climate change?", "medium"),
-        ("Explain the theory of evolution.", "medium"),
-        ("What is the process of how vaccines work?", "medium"),
-        ("Describe the water cycle.", "medium"),
-        
-        # High complexity queries (multihop, reasoning)
-        ("Who was the first president of the United States and what were his major achievements?", "high"),
-        ("Compare and contrast the causes of World War I and World War II.", "high"),
-        ("What are the similarities and differences between prokaryotes and eukaryotes before and after their evolution?", "high"),
-        ("How does the greenhouse effect contribute to climate change and what are the long-term consequences?", "high"),
-        ("Explain the relationship between supply and demand in economics and how it affects market prices.", "high"),
+
+    mapping = {
+        "low": 0,
+        "medium": 1,
+        "high": 2,
+    }
+
+    if level not in mapping:
+
+        raise ValueError(
+            f"Unknown qualitative complexity level: {level!r}"
+        )
+
+    return mapping[
+        level
     ]
 
 
-def test_complexity_evaluator(config_path=None, eva_model_path=None, verbose=True):
+# ==========================================================================
+# Main evaluator test
+# ==========================================================================
+
+def test_complexity_evaluator(
+    config_path: str | Path | None = None,
+    model_name: str = DEFAULT_ADAPTIVE_RAG_MODEL,
+    verbose: bool = True,
+) -> pd.DataFrame:
     """
-    Test the complexity evaluator on various queries.
-    
-    Args:
-        config_path: Path to config file
-        eva_model_path: Path to fine-tuned Eva model directory
-        verbose: Print detailed results
+    Evaluate the Adaptive-RAG complexity model on diagnostic queries.
+
+    Parameters
+    ----------
+    config_path:
+        Optional YAML configuration path.
+
+    model_name:
+        Hugging Face model identifier for the Adaptive-RAG-style evaluator.
+
+    verbose:
+        Whether to print detailed predictions.
+
+    Returns
+    -------
+    pandas.DataFrame
+        One row per diagnostic query.
     """
-    config = get_config(config_path)
-    
-    # Load the complexity evaluator
-    if eva_model_path is None:
-        raise ValueError(
-            "Eva model path is required. "
-            "Please provide path using --eva-model or train first:\n"
-            "  python experiments/train_complexity_evaluator.py <dataset.json>"
-        )
-    
-    if not os.path.exists(eva_model_path):
-        raise FileNotFoundError(
-            f"Eva model not found at: {eva_model_path}\n"
-            f"Please train the model first:\n"
-            f"  python experiments/train_complexity_evaluator.py <dataset.json>"
-        )
-    
-    try:
-        complexity_fn = load_complexity_evaluator(eva_model_path)
-        method = "Fine-tuned T5-Large Eva"
-    except Exception as e:
-        print(f"Error loading Eva model: {e}")
-        raise
-    
-    # Get test queries
-    test_queries = get_test_queries()
-    
-    # Evaluate complexity for each query
-    results = []
-    
+
+    # ------------------------------------------------------------------
+    # 1. Configuration.
+    # ------------------------------------------------------------------
+
+    config = get_config(
+        config_path
+    )
+
+    # ------------------------------------------------------------------
+    # 2. Load pretrained Adaptive-RAG reproduction.
+    #
+    # The primary replication does not require retraining T5-Large.
+    # ------------------------------------------------------------------
+
     if verbose:
-        print(f"\n{'='*80}")
-        print(f"Complexity Evaluator Test ({method})")
-        print(f"{'='*80}\n")
-    
-    for query, expected_level in test_queries:
-        prediction = complexity_fn.predict(query)
-        E = complexity_fn(query)
-        
-        results.append({
-            "query": query,
-            "expected_level": expected_level,
-            "complexity_score_E": E,
-            "predicted_class": prediction["label"],
-            "p_A_no_retrieval": prediction["probabilities"]["A"],
-            "p_B_single_step": prediction["probabilities"]["B"],
-            "p_C_multi_step": prediction["probabilities"]["C"],
-            "query_length": len(query.split()),
-        })
-        
-        if verbose:
-            print(f"Query: {query}")
-            print(
-                f"Expected Level: {expected_level:>8} | Class: {prediction['label']} "
-                f"| Complexity Score E: {E:.4f}"
+
+        print(
+            "Loading Adaptive-RAG query-complexity evaluator..."
+        )
+
+        print(
+            f"  Model: {model_name}"
+        )
+
+    evaluator = (
+        AdaptiveRAGComplexityEvaluator(
+            model_name=model_name
+        )
+    )
+
+    # ------------------------------------------------------------------
+    # 3. Evaluate diagnostic queries.
+    # ------------------------------------------------------------------
+
+    results: List[
+        Dict
+    ] = []
+
+    if verbose:
+
+        print(
+            "\n"
+            + "=" * 100
+        )
+
+        print(
+            "ADAPTIVE-RAG COMPLEXITY EVALUATOR SANITY CHECK"
+        )
+
+        print(
+            "=" * 100
+        )
+
+    for test_id, case in enumerate(
+        TEST_QUERIES
+    ):
+
+        query = case[
+            "query"
+        ]
+
+        expected_level = case[
+            "expected_level"
+        ]
+
+        complexity = (
+            evaluator.evaluate(
+                query
             )
-            print("-" * 80)
-    
-    # Create DataFrame for analysis
-    results_df = pd.DataFrame(results)
-    
-    # Statistics by complexity level
+        )
+
+        row = {
+            "test_id":
+                test_id,
+
+            "query":
+                query,
+
+            "qualitative_expected_level":
+                expected_level,
+
+            "qualitative_expected_rank":
+                qualitative_level_to_rank(
+                    expected_level
+                ),
+
+            "notes":
+                case.get(
+                    "notes"
+                ),
+
+            "predicted_class":
+                complexity.predicted_class,
+
+            "p_A_no_retrieval":
+                complexity.p_A,
+
+            "p_B_single_step":
+                complexity.p_B,
+
+            "p_C_multi_step":
+                complexity.p_C,
+
+            "complexity_score_E":
+                complexity.E,
+
+            "query_word_count":
+                len(
+                    query.split()
+                ),
+        }
+
+        results.append(
+            row
+        )
+
+        if verbose:
+
+            print(
+                f"\n[{test_id + 1}/{len(TEST_QUERIES)}]"
+            )
+
+            print(
+                f"Query:\n  {query}"
+            )
+
+            print(
+                f"Qualitative expectation: "
+                f"{expected_level}"
+            )
+
+            print(
+                "Adaptive-RAG probabilities:"
+            )
+
+            print(
+                f"  P(A) = {complexity.p_A:.6f}"
+            )
+
+            print(
+                f"  P(B) = {complexity.p_B:.6f}"
+            )
+
+            print(
+                f"  P(C) = {complexity.p_C:.6f}"
+            )
+
+            print(
+                f"Predicted class: "
+                f"{complexity.predicted_class}"
+            )
+
+            print(
+                f"Continuous E: "
+                f"{complexity.E:.6f}"
+            )
+
+            print(
+                "-" * 100
+            )
+
+    # ------------------------------------------------------------------
+    # 4. Results DataFrame.
+    # ------------------------------------------------------------------
+
+    results_df = pd.DataFrame(
+        results
+    )
+
+    # ------------------------------------------------------------------
+    # 5. Sanity checks.
+    # ------------------------------------------------------------------
+
+    probability_sums = (
+        results_df[
+            [
+                "p_A_no_retrieval",
+                "p_B_single_step",
+                "p_C_multi_step",
+            ]
+        ]
+        .sum(
+            axis=1
+        )
+        .to_numpy()
+    )
+
+    if not np.allclose(
+        probability_sums,
+        1.0,
+        atol=1e-5,
+    ):
+
+        raise ValueError(
+            "Adaptive-RAG class probabilities do not sum to 1."
+        )
+
+    E_values = (
+        results_df[
+            "complexity_score_E"
+        ]
+        .to_numpy()
+    )
+
+    if not np.all(
+        (
+            E_values >= 0.0
+        )
+        & (
+            E_values <= 1.0
+        )
+    ):
+
+        raise ValueError(
+            "At least one complexity score E lies outside [0, 1]."
+        )
+
+    # ------------------------------------------------------------------
+    # 6. Qualitative group summary.
+    # ------------------------------------------------------------------
+
+    level_summary = (
+        results_df
+        .groupby(
+            [
+                "qualitative_expected_rank",
+                "qualitative_expected_level",
+            ],
+            as_index=False,
+        )
+        .agg(
+            n_queries=(
+                "test_id",
+                "count",
+            ),
+
+            mean_E=(
+                "complexity_score_E",
+                "mean",
+            ),
+
+            std_E=(
+                "complexity_score_E",
+                "std",
+            ),
+
+            min_E=(
+                "complexity_score_E",
+                "min",
+            ),
+
+            max_E=(
+                "complexity_score_E",
+                "max",
+            ),
+
+            mean_p_A=(
+                "p_A_no_retrieval",
+                "mean",
+            ),
+
+            mean_p_B=(
+                "p_B_single_step",
+                "mean",
+            ),
+
+            mean_p_C=(
+                "p_C_multi_step",
+                "mean",
+            ),
+        )
+        .sort_values(
+            "qualitative_expected_rank"
+        )
+    )
+
+    # ------------------------------------------------------------------
+    # 7. Save.
+    # ------------------------------------------------------------------
+
+    result_dir = get_project_path(
+        config,
+        "complexity_eval_results",
+    )
+
+    result_dir.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    results_path = (
+        result_dir
+        / "complexity_test_queries.csv"
+    )
+
+    summary_path = (
+        result_dir
+        / "complexity_test_by_expected_level.csv"
+    )
+
+    results_df.to_csv(
+        results_path,
+        index=False,
+    )
+
+    level_summary.to_csv(
+        summary_path,
+        index=False,
+    )
+
+    # ------------------------------------------------------------------
+    # 8. Print summary.
+    # ------------------------------------------------------------------
+
     if verbose:
-        print(f"\n{'='*80}")
-        print("Summary Statistics by Expected Complexity Level")
-        print(f"{'='*80}\n")
-        
-        for level in ["low", "medium", "high"]:
-            level_data = results_df[results_df["expected_level"] == level]["complexity_score_E"]
-            if len(level_data) > 0:
-                print(f"{level.upper():>10}: "
-                      f"mean E = {level_data.mean():.4f}, "
-                      f"min E = {level_data.min():.4f}, "
-                      f"max E = {level_data.max():.4f}, "
-                      f"std E = {level_data.std():.4f}")
-    
-    # Save results
-    result_dir = resolve_project_path(config, "complexity_eval_results", create_if_missing=True)
-    os.makedirs(result_dir, exist_ok=True)
-    
-    csv_path = os.path.join(result_dir, f"complexity_test_{method.lower().replace(' ', '_')}.csv")
-    results_df.to_csv(csv_path, index=False)
-    
-    if verbose:
-        print(f"\nResults saved to: {csv_path}\n")
-    
+
+        print(
+            "\n"
+            + "=" * 100
+        )
+
+        print(
+            "SUMMARY BY QUALITATIVE EXPECTED LEVEL"
+        )
+
+        print(
+            "=" * 100
+        )
+
+        print(
+            "\n"
+            + level_summary[
+                [
+                    "qualitative_expected_level",
+                    "n_queries",
+                    "mean_E",
+                    "std_E",
+                    "min_E",
+                    "max_E",
+                    "mean_p_A",
+                    "mean_p_B",
+                    "mean_p_C",
+                ]
+            ]
+            .to_string(
+                index=False
+            )
+        )
+
+        print(
+            "\nSaved:"
+        )
+
+        print(
+            f"  {results_path}"
+        )
+
+        print(
+            f"  {summary_path}"
+        )
+
     return results_df
 
 
-def test_complexity_with_generation(config_path=None, eva_model_path=None, verbose=True):
-    """
-    Test complexity evaluator integrated with the generation pipeline.
-    
-    This demonstrates how complexity scores work together with the confidence
-    detector to produce activation scores K(ti) = (E - m_tilde_i) * s_i.
-    """
-    from _common import load_configured_model, detector_layers
-    from inker.generation import answer_with_confidence
-    import pickle
-    
-    config = get_config(config_path)
-    
-    # Load model and reader
-    tokenizer, model = load_configured_model(config)
-    reader_path = resolve_project_path(config, "representation_reader")
-    
-    if not os.path.exists(reader_path):
-        print(f"Error: Representation reader not found at {reader_path}")
-        print("Please run train_detector.py first.")
-        return None
-    
-    with open(reader_path, "rb") as f:
-        rep_reader = pickle.load(f)
-    
-    # Load complexity evaluator
-    if eva_model_path is None:
-        raise ValueError(
-            "Eva model path is required. "
-            "Please provide path using --eva-model or train first:\n"
-            "  python experiments/train_complexity_evaluator.py <dataset.json>"
-        )
-    
-    if not os.path.exists(eva_model_path):
-        raise FileNotFoundError(
-            f"Eva model not found at: {eva_model_path}"
-        )
-    
-    try:
-        complexity_fn = load_complexity_evaluator(eva_model_path)
-        method = "Fine-tuned T5-Large Eva"
-    except Exception as e:
-        print(f"Error loading Eva model: {e}")
-        raise
-    
-    # Test queries
-    test_questions = [
-        "What is the capital of France?",
-        "Compare and contrast photosynthesis and cellular respiration.",
-        "How does artificial intelligence work in large language models?",
-    ]
-    
-    result_dir = resolve_project_path(config, "complexity_generation_results", create_if_missing=True)
-    os.makedirs(result_dir, exist_ok=True)
-    
-    results = []
-    
-    if verbose:
-        print(f"\n{'='*80}")
-        print(f"Complexity Evaluator + Generation Test ({method})")
-        print(f"{'='*80}\n")
-    
-    for question in test_questions:
-        result = answer_with_confidence(
-            question=question,
-            tokenizer=tokenizer,
-            model=model,
-            rep_reader=rep_reader,
-            layers=detector_layers(config),
-            complexity_fn=complexity_fn,
-            threshold=0.5,
-            verbose=verbose,
-        )
-        
-        results.append(result)
-    
-    # Save detailed results
-    csv_path = os.path.join(result_dir, f"generation_test_{method.lower().replace(' ', '_')}.csv")
-    
-    export_results = []
-    for result in results:
-        for entry in result["token_entries"]:
-            export_results.append({
-                "question": result["question"],
-                "E": result["E"],
-                "token": entry.get("token", ""),
-                "token_index": entry.get("token_index", -1),
-                "s_i": entry.get("s_i", 0),
-                "m_tilde": entry.get("m_tilde", None),
-                "K": entry.get("K", None),
-                "is_content": entry.get("is_content", False),
-                "skip": entry.get("skip", True),
-            })
-    
-    export_df = pd.DataFrame(export_results)
-    export_df.to_csv(csv_path, index=False)
-    
-    if verbose:
-        print(f"Detailed results saved to: {csv_path}\n")
-    
-    return results
+# ==========================================================================
+# CLI
+# ==========================================================================
 
+def main() -> None:
+    """
+    Command-line entry point.
+    """
 
-def main():
     parser = argparse.ArgumentParser(
-        description="Test the complexity evaluator (Eva)"
+        description=(
+            "Test the Adaptive-RAG-style external query complexity evaluator."
+        )
     )
+
     parser.add_argument(
         "--config",
         type=str,
         default=None,
-        help="Path to config file (default: configs/default.yaml)",
+        help=(
+            "Optional YAML configuration path. "
+            "Defaults to configs/default.yaml."
+        ),
     )
+
     parser.add_argument(
-        "--eva-model",
+        "--model",
         type=str,
-        required=True,
-        help="Path to fine-tuned Eva model directory (required)",
+        default=DEFAULT_ADAPTIVE_RAG_MODEL,
+        help=(
+            "Adaptive-RAG-style T5 model identifier. "
+            f"Default: {DEFAULT_ADAPTIVE_RAG_MODEL}"
+        ),
     )
+
     parser.add_argument(
-        "--with-generation",
+        "--quiet",
         action="store_true",
-        help="Test complexity evaluator integrated with generation pipeline",
+        help=(
+            "Suppress detailed per-query output."
+        ),
     )
-    parser.add_argument(
-        "--verbose",
-        action="store_true",
-        default=True,
-        help="Print detailed results (default: True)",
-    )
-    
+
     args = parser.parse_args()
-    
-    # Test complexity evaluator alone
+
     test_complexity_evaluator(
         config_path=args.config,
-        eva_model_path=args.eva_model,
-        verbose=args.verbose,
+        model_name=args.model,
+        verbose=not args.quiet,
     )
-    
-    # Test complexity evaluator with generation if requested
-    if args.with_generation:
-        test_complexity_with_generation(
-            config_path=args.config,
-            eva_model_path=args.eva_model,
-            verbose=args.verbose,
-        )
 
 
 if __name__ == "__main__":
