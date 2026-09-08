@@ -1,188 +1,628 @@
+"""
+Dataset preparation utilities for the INKER confidence detector.
+
+This module builds the contrastive confident/unconfident statement pairs used
+to learn the internal confidence representation direction.
+
+It is responsible only for the CONFIDENCE-DETECTOR training dataset.
+
+Dataset format
+--------------
+The input JSON file is expected to contain two top-level dictionaries:
+
+    {
+        "confident": {
+            "topic_1": [...],
+            "topic_2": [...],
+            ...
+        },
+
+        "unconfident": {
+            "topic_1": [...],
+            "topic_2": [...],
+            ...
+        }
+    }
+
+For each topic, confident statement i is paired with unconfident statement i:
+
+    confident[i]  <->  unconfident[i]
+
+Each statement is tokenized and converted into multiple prefix truncations.
+Matching confident/unconfident truncations are then wrapped with the INKER
+instruction templates:
+
+    [INST] Pretend you're a confident person making statements about the world.
+    [/INST] <confident prefix>
+
+and:
+
+    [INST] Pretend you're an unconfident person making statements about the world.
+    [/INST] <unconfident prefix>
+
+These contrastive pairs are later used to learn the confidence representation
+direction from hidden states.
+
+Splitting strategy
+------------------
+Pairs are split independently WITHIN every topic.
+
+This ensures that train, evaluation, and test sets contain examples from every
+topic, provided that each topic contains at least three generated pairs.
+
+Pairs are never broken across splits.
+
+Training pairs:
+    The two members of each pair are randomly reordered. A corresponding
+    pair-level Boolean label records which member is the confident example.
+
+Evaluation/test pairs:
+    The order is kept fixed as:
+
+        [confident, unconfident]
+
+    with labels:
+
+        [1, 0]
+
+This makes pairwise evaluation straightforward.
+
+Important
+---------
+The returned training ``data`` is flattened:
+
+    [pair0_text0, pair0_text1, pair1_text0, pair1_text1, ...]
+
+while ``labels`` remains pair-level:
+
+    [[True, False], [False, True], ...]
+
+This is intentional because the direction-learning stage operates on
+contrastive pairs after hidden-state extraction.
+"""
+
+from __future__ import annotations
+
 import json
 import random
-import numpy as np
+from collections import defaultdict
+from pathlib import Path
+from typing import Any, Dict, List, Sequence, Tuple
 
+
+# ---------------------------------------------------------------------------
+# Prompt template used to construct confident/unconfident examples.
+# ---------------------------------------------------------------------------
 
 USER_TAG = "[INST]"
 ASSISTANT_TAG = "[/INST]"
-TEMPLATE_STR = "Pretend you're {type} person making statements about the world."
+
+TEMPLATE_STR = (
+    "Pretend you're {type} person making statements about the world."
+)
+
 POS_TAG = "a confident"
 NEG_TAG = "an unconfident"
 
 
-def build_inker_pairs(
-    statements_path,
-    tokenizer,
-    user_tag=USER_TAG,
-    assistant_tag=ASSISTANT_TAG,
-    pos_tag=POS_TAG,
-    neg_tag=NEG_TAG,
-    seed=0,
-):
+def _load_statements_json(
+    statements_path: str | Path,
+) -> Dict[str, Any]:
     """
-    Build the confident/unconfident truncated statement pairs.
+    Load the confident/unconfident statement JSON file.
 
-    Algorithmically identical to the original Colab implementation.
+    UTF-8 is attempted first. Windows-1252 is used as a fallback because
+    some versions of the original generated dataset were stored using that
+    encoding.
+
+    Parameters
+    ----------
+    statements_path:
+        Path to the JSON statement dataset.
+
+    Returns
+    -------
+    dict
+        Parsed JSON dictionary.
+
+    Raises
+    ------
+    FileNotFoundError
+        If the dataset file does not exist.
+
+    ValueError
+        If the required ``confident`` or ``unconfident`` sections are absent.
     """
+
+    statements_path = Path(statements_path)
+
+    if not statements_path.exists():
+        raise FileNotFoundError(
+            f"Statement dataset not found: {statements_path}"
+        )
+
+    try:
+        with statements_path.open(
+            "r",
+            encoding="utf-8",
+        ) as file:
+            data = json.load(file)
+
+    except UnicodeDecodeError:
+        with statements_path.open(
+            "r",
+            encoding="windows-1252",
+        ) as file:
+            data = json.load(file)
+
+    if "confident" not in data:
+        raise ValueError(
+            "Dataset is missing the top-level 'confident' section."
+        )
+
+    if "unconfident" not in data:
+        raise ValueError(
+            "Dataset is missing the top-level 'unconfident' section."
+        )
+
+    return data
+
+
+def build_inker_pairs(
+    statements_path: str | Path,
+    tokenizer: Any,
+    user_tag: str = USER_TAG,
+    assistant_tag: str = ASSISTANT_TAG,
+    pos_tag: str = POS_TAG,
+    neg_tag: str = NEG_TAG,
+    seed: int = 0,
+) -> Tuple[
+    List[str],
+    List[str],
+    List[str],
+    List[str],
+]:
+    """
+    Build truncated confident/unconfident contrastive statement pairs.
+
+    For every topic:
+
+    1. Pair confident statement i with unconfident statement i.
+    2. Tokenize both statements.
+    3. Produce progressively longer prefixes.
+    4. Pair confident and unconfident prefixes with the same truncation index.
+    5. Wrap each prefix with its corresponding confidence instruction.
+    6. Record the topic associated with each generated pair.
+
+    The final five tokens of each original statement are excluded from the
+    truncation range, matching the previous INKER replication procedure.
+
+    Parameters
+    ----------
+    statements_path:
+        Path to the JSON file containing the confident and unconfident
+        statements grouped by topic.
+
+    tokenizer:
+        Hugging Face tokenizer used by the target language model.
+
+    user_tag:
+        Opening instruction tag.
+
+    assistant_tag:
+        Closing instruction tag.
+
+    pos_tag:
+        Text inserted into the template for confident examples.
+
+    neg_tag:
+        Text inserted into the template for unconfident examples.
+
+    seed:
+        Reserved random seed for reproducibility.
+
+        The current pair-construction procedure itself is deterministic, but
+        the argument is retained for compatibility with the previous pipeline
+        and future sampling extensions.
+
+    Returns
+    -------
+    confident_statements:
+        Flattened list of truncated confident prompts.
+
+    unconfident_statements:
+        Flattened list of corresponding truncated unconfident prompts.
+
+    topics:
+        List of all topic names found in the dataset.
+
+    pair_topics:
+        Topic corresponding to each confident/unconfident pair.
+
+    Raises
+    ------
+    ValueError
+        If a topic is missing from one side of the dataset.
+    """
+
     random.seed(seed)
 
-    with open(statements_path, "r", encoding="windows-1252") as f:
-        data = json.loads(f.read())
+    data = _load_statements_json(
+        statements_path
+    )
 
-    honest_statements = []
-    untruthful_statements = []
-    pair_topics = []
+    confident_statements: List[str] = []
+    unconfident_statements: List[str] = []
+    pair_topics: List[str] = []
 
-    topics = list(data["confident"].keys())
+    topics = list(
+        data["confident"].keys()
+    )
 
     for topic in topics:
+
+        if topic not in data["unconfident"]:
+            raise ValueError(
+                f"Topic '{topic}' exists in 'confident' but not "
+                "in 'unconfident'."
+            )
+
         conf_list = data["confident"][topic]
         unconf_list = data["unconfident"][topic]
 
-        for c_stmt, u_stmt in zip(conf_list, unconf_list):
-            c_tokens = tokenizer.tokenize(c_stmt)
-            u_tokens = tokenizer.tokenize(u_stmt)
+        if len(conf_list) != len(unconf_list):
+            raise ValueError(
+                f"Topic '{topic}' has {len(conf_list)} confident "
+                f"statements but {len(unconf_list)} unconfident statements. "
+                "The two lists must have equal length."
+            )
 
-            c_truncations = [
-                tokenizer.convert_tokens_to_string(c_tokens[:idx])
-                for idx in range(1, len(c_tokens) - 5)
-            ]
-            u_truncations = [
-                tokenizer.convert_tokens_to_string(u_tokens[:idx])
-                for idx in range(1, len(u_tokens) - 5)
-            ]
+        for confident_statement, unconfident_statement in zip(
+            conf_list,
+            unconf_list,
+        ):
+            confident_tokens = tokenizer.tokenize(
+                confident_statement
+            )
 
-            for c_trunc, u_trunc in zip(c_truncations, u_truncations):
-                honest_statements.append(
-                    f"{user_tag} {TEMPLATE_STR.format(type=pos_tag)} "
-                    f"{assistant_tag} {c_trunc}"
+            unconfident_tokens = tokenizer.tokenize(
+                unconfident_statement
+            )
+
+            # -----------------------------------------------------------
+            # Build progressively longer statement prefixes.
+            #
+            # Example:
+            #
+            # tokens = [t1, t2, t3, ..., tn]
+            #
+            # produces:
+            #
+            # [t1]
+            # [t1, t2]
+            # [t1, t2, t3]
+            # ...
+            #
+            # while excluding the last five token positions.
+            # -----------------------------------------------------------
+
+            confident_truncations = [
+                tokenizer.convert_tokens_to_string(
+                    confident_tokens[:idx]
                 )
-                untruthful_statements.append(
-                    f"{user_tag} {TEMPLATE_STR.format(type=neg_tag)} "
-                    f"{assistant_tag} {u_trunc}"
+                for idx in range(
+                    1,
+                    len(confident_tokens) - 5,
                 )
-                pair_topics.append(topic)
+            ]
 
-    return honest_statements, untruthful_statements, topics, pair_topics
+            unconfident_truncations = [
+                tokenizer.convert_tokens_to_string(
+                    unconfident_tokens[:idx]
+                )
+                for idx in range(
+                    1,
+                    len(unconfident_tokens) - 5,
+                )
+            ]
+
+            # -----------------------------------------------------------
+            # zip() intentionally keeps only truncation positions that
+            # exist on BOTH sides of the confident/unconfident pair.
+            #
+            # This prevents a longer statement from contributing unmatched
+            # prefixes.
+            # -----------------------------------------------------------
+
+            for confident_prefix, unconfident_prefix in zip(
+                confident_truncations,
+                unconfident_truncations,
+            ):
+                confident_prompt = (
+                    f"{user_tag} "
+                    f"{TEMPLATE_STR.format(type=pos_tag)} "
+                    f"{assistant_tag} "
+                    f"{confident_prefix}"
+                )
+
+                unconfident_prompt = (
+                    f"{user_tag} "
+                    f"{TEMPLATE_STR.format(type=neg_tag)} "
+                    f"{assistant_tag} "
+                    f"{unconfident_prefix}"
+                )
+
+                confident_statements.append(
+                    confident_prompt
+                )
+
+                unconfident_statements.append(
+                    unconfident_prompt
+                )
+
+                pair_topics.append(
+                    topic
+                )
+
+    return (
+        confident_statements,
+        unconfident_statements,
+        topics,
+        pair_topics,
+    )
+
+
+def _flatten_pairs(
+    pairs: Sequence[Sequence[str]],
+) -> List[str]:
+    """
+    Flatten a list of two-element statement pairs.
+
+    Example
+    -------
+    Input:
+
+        [
+            ["conf_1", "unconf_1"],
+            ["conf_2", "unconf_2"],
+        ]
+
+    Output:
+
+        [
+            "conf_1",
+            "unconf_1",
+            "conf_2",
+            "unconf_2",
+        ]
+    """
+
+    return [
+        statement
+        for pair in pairs
+        for statement in pair
+    ]
 
 
 def make_split(
-    honest_statements,
-    untruthful_statements,
-    pair_topics,
-    train_ratio=0.70,
-    eval_ratio=0.15,
-    test_ratio=0.15,
-    seed=0,
-):
+    honest_statements: Sequence[str],
+    untruthful_statements: Sequence[str],
+    pair_topics: Sequence[str],
+    train_ratio: float = 0.70,
+    eval_ratio: float = 0.15,
+    test_ratio: float = 0.15,
+    seed: int = 0,
+) -> Dict[str, Dict[str, Any]]:
     """
-    Topic-stratified split.
+    Create topic-stratified train, evaluation, and test splits.
 
-    Ensures that train, eval, and test each receive confident/unconfident
-    pairs from every topic, as long as the topic has enough examples.
+    Each confident/unconfident pair remains intact throughout the split.
 
-    Each pair is kept intact:
-        (confident_i, unconfident_i)
+    Every topic is split independently, ensuring that train, evaluation,
+    and test sets all contain examples from every topic whenever at least
+    three pairs are available for that topic.
 
-    The order of the two statements inside training pairs is randomized,
-    exactly as in the original training procedure.
+    Parameters
+    ----------
+    honest_statements:
+        Confident prompts.
 
-    Eval/test pairs remain ordered as:
-        [confident, unconfident]
+        The name is retained for compatibility with the existing repository.
+        Conceptually, these are ``confident_statements``.
 
-    so evaluation can use labels:
-        [1, 0]
+    untruthful_statements:
+        Unconfident prompts.
+
+        The name is retained for compatibility with the existing repository.
+        Conceptually, these are ``unconfident_statements``.
+
+    pair_topics:
+        Topic associated with each confident/unconfident pair.
+
+    train_ratio:
+        Fraction of each topic assigned to training.
+
+    eval_ratio:
+        Fraction of each topic assigned to evaluation.
+
+    test_ratio:
+        Fraction of each topic assigned to testing.
+
+    seed:
+        Random seed used for all pair-level shuffling.
+
+    Returns
+    -------
+    dict
+        Dictionary containing ``train``, ``eval``, and ``test`` splits.
+
+        Training format:
+
+            {
+                "data": [
+                    text_0,
+                    text_1,
+                    text_2,
+                    text_3,
+                    ...
+                ],
+
+                "labels": [
+                    [True, False],
+                    [False, True],
+                    ...
+                ],
+
+                "topics": [
+                    topic_for_pair_0,
+                    topic_for_pair_1,
+                    ...
+                ]
+            }
+
+        Evaluation/test format:
+
+            data:
+                flattened [confident, unconfident] pairs
+
+            labels:
+                [[1, 0], [1, 0], ...]
+
+            topics:
+                one topic entry per pair
+
+    Raises
+    ------
+    ValueError
+        If:
+        - split ratios do not sum to one,
+        - input lengths do not match,
+        - or a topic contains fewer than three pairs.
     """
 
-    import random
-    import numpy as np
-    from collections import defaultdict
+    # ------------------------------------------------------------------
+    # 1. Validate arguments.
+    # ------------------------------------------------------------------
 
     if abs(
-        train_ratio + eval_ratio + test_ratio - 1.0
+        train_ratio
+        + eval_ratio
+        + test_ratio
+        - 1.0
     ) > 1e-8:
         raise ValueError(
-            "train_ratio + eval_ratio + test_ratio must equal 1.0"
+            "train_ratio + eval_ratio + test_ratio must equal 1.0."
+        )
+
+    if not (
+        len(honest_statements)
+        == len(untruthful_statements)
+        == len(pair_topics)
+    ):
+        raise ValueError(
+            "honest_statements, untruthful_statements, and pair_topics "
+            "must contain the same number of elements."
         )
 
     rng = random.Random(seed)
 
-    # ---------------------------------------------------------
-    # 1. Group complete confident/unconfident pairs by topic
-    # ---------------------------------------------------------
+    # ------------------------------------------------------------------
+    # 2. Group COMPLETE confident/unconfident pairs by topic.
+    #
+    # No statement is split independently.
+    # ------------------------------------------------------------------
 
-    topic_pairs = defaultdict(list)
+    topic_pairs: Dict[str, List[List[str]]] = defaultdict(
+        list
+    )
 
-    for honest, untruthful, topic in zip(
+    for confident, unconfident, topic in zip(
         honest_statements,
         untruthful_statements,
         pair_topics,
     ):
         topic_pairs[topic].append(
-            [honest, untruthful]
+            [
+                confident,
+                unconfident,
+            ]
         )
 
-    # ---------------------------------------------------------
-    # 2. Containers for final splits
-    # ---------------------------------------------------------
+    # ------------------------------------------------------------------
+    # 3. Containers for the final splits.
+    # ------------------------------------------------------------------
 
-    train_pairs = []
-    train_labels = []
-    train_topics = []
+    train_pairs: List[List[str]] = []
+    train_labels: List[List[bool]] = []
+    train_topics: List[str] = []
 
-    eval_pairs = []
-    eval_topics = []
+    eval_pairs: List[List[str]] = []
+    eval_topics: List[str] = []
 
-    test_pairs = []
-    test_topics = []
+    test_pairs: List[List[str]] = []
+    test_topics: List[str] = []
 
-    # ---------------------------------------------------------
-    # 3. Split EACH topic independently
-    # ---------------------------------------------------------
+    # ------------------------------------------------------------------
+    # 4. Split EACH topic independently.
+    # ------------------------------------------------------------------
 
     for topic, pairs in topic_pairs.items():
 
         pairs = pairs.copy()
-        rng.shuffle(pairs)
 
-        n = len(pairs)
+        rng.shuffle(
+            pairs
+        )
 
-        # Require enough examples to put at least one pair
-        # in every split.
-        if n < 3:
+        n_pairs = len(
+            pairs
+        )
+
+        # We require at least one pair in train, eval, and test.
+        if n_pairs < 3:
             raise ValueError(
-                f"Topic '{topic}' only has {n} pairs. "
-                "At least 3 are required for train/eval/test."
+                f"Topic '{topic}' contains only {n_pairs} pairs. "
+                "At least 3 pairs are required to create "
+                "train/eval/test splits."
             )
 
         n_train = int(
-            round(n * train_ratio)
+            round(
+                n_pairs * train_ratio
+            )
         )
 
         n_eval = int(
-            round(n * eval_ratio)
+            round(
+                n_pairs * eval_ratio
+            )
         )
 
-        # Make sure all three splits contain at least one pair.
+        # --------------------------------------------------------------
+        # Guarantee at least one pair remains for each split.
+        # --------------------------------------------------------------
+
         n_train = max(
             1,
-            min(n_train, n - 2),
+            min(
+                n_train,
+                n_pairs - 2,
+            ),
         )
 
         n_eval = max(
             1,
-            min(n_eval, n - n_train - 1),
+            min(
+                n_eval,
+                n_pairs - n_train - 1,
+            ),
         )
 
         n_test = (
-            n
+            n_pairs
             - n_train
             - n_eval
         )
-
-        # -----------------------------------------------------
-        # Topic-specific slices
-        # -----------------------------------------------------
 
         topic_train = pairs[
             :n_train
@@ -197,29 +637,45 @@ def make_split(
             n_train + n_eval:
         ]
 
-        # -----------------------------------------------------
+        # --------------------------------------------------------------
         # TRAIN
         #
-        # Preserve the original behavior:
-        # randomly shuffle the two members of each pair and
-        # remember which one is the confident statement.
-        # -----------------------------------------------------
+        # Each original pair starts as:
+        #
+        #     [confident, unconfident]
+        #
+        # We randomly reorder the two members and record which position
+        # contains the confident statement.
+        #
+        # Example:
+        #
+        # shuffled:
+        #     [unconfident, confident]
+        #
+        # labels:
+        #     [False, True]
+        #
+        # This prevents the confidence direction learner from exploiting
+        # a fixed positional ordering.
+        # --------------------------------------------------------------
 
         for pair in topic_train:
 
-            pair = pair.copy()
+            shuffled_pair = pair.copy()
 
             confident_statement = pair[0]
 
-            rng.shuffle(pair)
+            rng.shuffle(
+                shuffled_pair
+            )
 
             labels = [
                 statement == confident_statement
-                for statement in pair
+                for statement in shuffled_pair
             ]
 
             train_pairs.append(
-                pair
+                shuffled_pair
             )
 
             train_labels.append(
@@ -230,12 +686,17 @@ def make_split(
                 topic
             )
 
-        # -----------------------------------------------------
-        # EVAL
+        # --------------------------------------------------------------
+        # EVALUATION
         #
-        # Keep:
+        # Keep deterministic ordering:
+        #
         #     [confident, unconfident]
-        # -----------------------------------------------------
+        #
+        # so the corresponding label is:
+        #
+        #     [1, 0]
+        # --------------------------------------------------------------
 
         for pair in topic_eval:
 
@@ -247,9 +708,11 @@ def make_split(
                 topic
             )
 
-        # -----------------------------------------------------
+        # --------------------------------------------------------------
         # TEST
-        # -----------------------------------------------------
+        #
+        # Same deterministic pair ordering as evaluation.
+        # --------------------------------------------------------------
 
         for pair in topic_test:
 
@@ -261,13 +724,12 @@ def make_split(
                 topic
             )
 
-    # ---------------------------------------------------------
-    # 4. Shuffle pairs ACROSS topics
+    # ------------------------------------------------------------------
+    # 5. Shuffle complete pairs ACROSS topics.
     #
-    # Important:
-    # shuffle at pair level, not text level.
-    # Otherwise confident/unconfident pairs would be broken.
-    # ---------------------------------------------------------
+    # We shuffle at pair level rather than text level so confident and
+    # unconfident members are never separated.
+    # ------------------------------------------------------------------
 
     train_combined = list(
         zip(
@@ -282,18 +744,18 @@ def make_split(
     )
 
     train_pairs = [
-        x[0]
-        for x in train_combined
+        pair
+        for pair, _, _ in train_combined
     ]
 
     train_labels = [
-        x[1]
-        for x in train_combined
+        labels
+        for _, labels, _ in train_combined
     ]
 
     train_topics = [
-        x[2]
-        for x in train_combined
+        topic
+        for _, _, topic in train_combined
     ]
 
     eval_combined = list(
@@ -308,13 +770,13 @@ def make_split(
     )
 
     eval_pairs = [
-        x[0]
-        for x in eval_combined
+        pair
+        for pair, _ in eval_combined
     ]
 
     eval_topics = [
-        x[1]
-        for x in eval_combined
+        topic
+        for _, topic in eval_combined
     ]
 
     test_combined = list(
@@ -329,44 +791,60 @@ def make_split(
     )
 
     test_pairs = [
-        x[0]
-        for x in test_combined
+        pair
+        for pair, _ in test_combined
     ]
 
     test_topics = [
-        x[1]
-        for x in test_combined
+        topic
+        for _, topic in test_combined
     ]
 
-    # ---------------------------------------------------------
-    # 5. Flatten pairs
+    # ------------------------------------------------------------------
+    # 6. Flatten the text pairs.
     #
-    # The detector expects:
+    # Example:
     #
-    # [text1, text2, text1, text2, ...]
-    # ---------------------------------------------------------
+    # [
+    #     [text_1, text_2],
+    #     [text_3, text_4],
+    # ]
+    #
+    # becomes:
+    #
+    # [
+    #     text_1,
+    #     text_2,
+    #     text_3,
+    #     text_4,
+    # ]
+    #
+    # The hidden-state extraction code expects this flattened format.
+    # ------------------------------------------------------------------
 
-    train_data = np.concatenate(
+    train_data = _flatten_pairs(
         train_pairs
-    ).tolist()
+    )
 
-    eval_data = np.concatenate(
+    eval_data = _flatten_pairs(
         eval_pairs
-    ).tolist()
+    )
 
-    test_data = np.concatenate(
+    test_data = _flatten_pairs(
         test_pairs
-    ).tolist()
+    )
 
-    # ---------------------------------------------------------
-    # 6. Labels for eval/test
+    # ------------------------------------------------------------------
+    # 7. Evaluation/test labels.
     #
-    # Since eval/test pair order is:
+    # Because every eval/test pair is ordered:
+    #
     #     [confident, unconfident]
     #
-    # labels are:
+    # the labels are always:
+    #
     #     [1, 0]
-    # ---------------------------------------------------------
+    # ------------------------------------------------------------------
 
     eval_labels = [
         [1, 0]
@@ -378,9 +856,9 @@ def make_split(
         for _ in test_pairs
     ]
 
-    # ---------------------------------------------------------
-    # 7. Diagnostics
-    # ---------------------------------------------------------
+    # ------------------------------------------------------------------
+    # 8. Diagnostics.
+    # ------------------------------------------------------------------
 
     print(
         f"Topics: {len(topic_pairs)}"
@@ -402,52 +880,57 @@ def make_split(
     )
 
     print(
-        f"Train topics: "
-        f"{len(set(train_topics))}"
+        f"Train topics: {len(set(train_topics))}"
     )
 
     print(
-        f"Eval topics: "
-        f"{len(set(eval_topics))}"
+        f"Eval topics: {len(set(eval_topics))}"
     )
 
     print(
-        f"Test topics: "
-        f"{len(set(test_topics))}"
+        f"Test topics: {len(set(test_topics))}"
     )
+
+    # Sanity check: every topic should appear in all three splits.
+    expected_topics = set(
+        topic_pairs.keys()
+    )
+
+    if set(train_topics) != expected_topics:
+        raise RuntimeError(
+            "Training split does not contain every dataset topic."
+        )
+
+    if set(eval_topics) != expected_topics:
+        raise RuntimeError(
+            "Evaluation split does not contain every dataset topic."
+        )
+
+    if set(test_topics) != expected_topics:
+        raise RuntimeError(
+            "Test split does not contain every dataset topic."
+        )
+
+    # ------------------------------------------------------------------
+    # 9. Return the existing repository interface unchanged.
+    # ------------------------------------------------------------------
 
     return {
-
         "train": {
-            "data":
-                train_data,
-
-            "labels":
-                train_labels,
-
-            "topics":
-                train_topics,
+            "data": train_data,
+            "labels": train_labels,
+            "topics": train_topics,
         },
 
         "eval": {
-            "data":
-                eval_data,
-
-            "labels":
-                eval_labels,
-
-            "topics":
-                eval_topics,
+            "data": eval_data,
+            "labels": eval_labels,
+            "topics": eval_topics,
         },
 
         "test": {
-            "data":
-                test_data,
-
-            "labels":
-                test_labels,
-
-            "topics":
-                test_topics,
+            "data": test_data,
+            "labels": test_labels,
+            "topics": test_topics,
         },
     }
