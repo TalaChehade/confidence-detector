@@ -1,61 +1,74 @@
-# src/inker/complexity.py
+"""Adaptive-RAG external query-complexity evaluator.
 
-"""
-Query-complexity evaluator used by the INKER replication.
+This module implements the external-knowledge component E used by the
+INKER IE-KRT replication.
 
-The original Adaptive-RAG classifier predicts one of three query-complexity
-classes:
+The complexity classifier is:
 
-    A -> no retrieval
-    B -> single-step retrieval
-    C -> multi-step retrieval
+    T5-Large
+        ↓
+    4-bit NF4 base model
+        ↓
+    LoRA adapter trained on Adaptive-RAG classifier data
+        ↓
+    A / B / C probabilities
 
-For the INKER replication, we need a continuous external complexity score E
-that can be compared with the normalized internal confidence score.
+Adaptive-RAG labels:
 
-IMPORTANT:
-The INKER paper does not clearly specify the exact conversion from the
-Adaptive-RAG-style A/B/C output to continuous E.
+    A = no retrieval
+    B = single-step retrieval
+    C = multi-step retrieval
 
-We therefore use the following explicit replication assumption:
+For the INKER replication, the discrete labels are converted into a
+continuous complexity score using:
 
-    A -> 0.0
-    B -> 0.5
-    C -> 1.0
+    E = 0*P(A) + 0.5*P(B) + 1*P(C)
 
-and compute the probability-weighted expected complexity:
+      = 0.5*P(B) + P(C)
 
-    E = 0.0 * P(A) + 0.5 * P(B) + 1.0 * P(C)
-
-      = 0.5 * P(B) + P(C)
-
-This preserves the uncertainty of the classifier instead of using only the
-hard predicted class.
+The A/B/C -> {0, 0.5, 1} mapping is a replication assumption. It should
+not be presented as an exact formula released by the INKER authors.
 """
 
 from __future__ import annotations
 
+import os
+import shutil
+import zipfile
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Dict, Optional
 
 import torch
-import torch.nn.functional as F
-from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
+from peft import PeftModel
+from transformers import (
+    AutoModelForSeq2SeqLM,
+    AutoTokenizer,
+    BitsAndBytesConfig,
+)
 
 
-DEFAULT_ADAPTIVE_RAG_MODEL = "LenckCuak/Adaptive-RAG"
+DEFAULT_ADAPTIVE_RAG_BASE_MODEL = "t5-large"
+
+LABELS = ("A", "B", "C")
+
+LABEL_VALUES = {
+    "A": 0.0,
+    "B": 0.5,
+    "C": 1.0,
+}
 
 
 @dataclass
 class ComplexityResult:
-    """
-    Output produced by the Adaptive-RAG complexity evaluator.
-    """
+    """Output produced by the Adaptive-RAG complexity evaluator."""
 
     predicted_class: str
+
     p_A: float
     p_B: float
     p_C: float
+
     E: float
 
     def to_dict(self) -> Dict[str, float | str]:
@@ -68,212 +81,388 @@ class ComplexityResult:
         }
 
 
-class AdaptiveRAGComplexityEvaluator:
+def _find_adapter_directory(root: Path) -> Path:
+    """Find the directory containing adapter_config.json."""
+
+    direct_config = root / "adapter_config.json"
+
+    if direct_config.exists():
+        return root
+
+    matches = list(root.rglob("adapter_config.json"))
+
+    if len(matches) == 1:
+        return matches[0].parent
+
+    if len(matches) == 0:
+        raise FileNotFoundError(
+            f"No adapter_config.json was found inside {root}"
+        )
+
+    raise RuntimeError(
+        "Multiple LoRA adapters were found inside "
+        f"{root}. Please provide the exact adapter directory."
+    )
+
+
+def _prepare_adapter_path(adapter_path: str) -> Path:
+    """Resolve an adapter directory or extract an adapter ZIP.
+
+    This allows the config to point directly to the ZIP stored on
+    Google Drive.
+
+    Example:
+
+        /content/drive/MyDrive/INKER_Models/
+        adaptive_rag_t5_large_lora.zip
     """
-    Evaluate query complexity using a pretrained Adaptive-RAG T5 classifier.
 
-    Parameters
-    ----------
-    model_name:
-        Hugging Face model identifier or local path.
+    expanded = os.path.expandvars(
+        os.path.expanduser(adapter_path)
+    )
 
-    device:
-        Device on which the model will run.
-        If None:
-            CUDA is used when available,
-            otherwise CPU.
+    path = Path(expanded)
 
-    max_input_length:
-        Maximum number of input tokens given to T5.
-    """
+    if not path.exists():
+        raise FileNotFoundError(
+            "Adaptive-RAG LoRA adapter was not found:\n"
+            f"{path}\n\n"
+            "If the model is stored in Google Drive, make sure "
+            "Drive is mounted before running the experiment."
+        )
 
-    LABELS = ("A", "B", "C")
+    if path.is_dir():
+        return _find_adapter_directory(path)
 
-    # Ordinal values used by this replication.
-    LABEL_VALUES = {
-        "A": 0.0,
-        "B": 0.5,
-        "C": 1.0,
+    if path.suffix.lower() != ".zip":
+        raise ValueError(
+            "adapter_path must point either to an extracted "
+            "LoRA adapter directory or to a .zip archive."
+        )
+
+    # Extract into local Colab storage rather than repeatedly reading
+    # model files from mounted Google Drive.
+    extraction_dir = Path(
+        "/content/inker_adaptive_rag_adapter"
+    )
+
+    marker = extraction_dir / ".extracted"
+
+    if not marker.exists():
+        if extraction_dir.exists():
+            shutil.rmtree(extraction_dir)
+
+        extraction_dir.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        print(
+            "Extracting Adaptive-RAG LoRA adapter..."
+        )
+
+        with zipfile.ZipFile(path, "r") as archive:
+            archive.extractall(extraction_dir)
+
+        marker.touch()
+
+        print(
+            "✓ Adapter extracted to:",
+            extraction_dir,
+        )
+
+    return _find_adapter_directory(
+        extraction_dir
+    )
+
+
+def _dtype_from_name(name: str) -> torch.dtype:
+    """Resolve the requested 4-bit computation dtype."""
+
+    name = str(name).lower()
+
+    if name == "auto":
+        if (
+            torch.cuda.is_available()
+            and torch.cuda.is_bf16_supported()
+        ):
+            return torch.bfloat16
+
+        return torch.float16
+
+    mapping = {
+        "float16": torch.float16,
+        "fp16": torch.float16,
+        "bfloat16": torch.bfloat16,
+        "bf16": torch.bfloat16,
+        "float32": torch.float32,
+        "fp32": torch.float32,
     }
+
+    if name not in mapping:
+        raise ValueError(
+            f"Unsupported compute dtype: {name}"
+        )
+
+    return mapping[name]
+
+
+class AdaptiveRAGComplexityEvaluator:
+    """Adaptive-RAG T5-Large + LoRA complexity evaluator."""
 
     def __init__(
         self,
-        model_name: str = DEFAULT_ADAPTIVE_RAG_MODEL,
-        device: Optional[str] = None,
+        adapter_path: str,
+        base_model_name: str = DEFAULT_ADAPTIVE_RAG_BASE_MODEL,
         max_input_length: int = 384,
-    ) -> None:
+        load_in_4bit: bool = True,
+        compute_dtype: str = "auto",
+    ):
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                "The current complexity evaluator is configured "
+                "for BitsAndBytes 4-bit inference and requires CUDA."
+            )
 
-        if device is None:
-            device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.base_model_name = base_model_name
+        self.max_input_length = int(
+            max_input_length
+        )
 
-        self.device = torch.device(device)
-        self.max_input_length = max_input_length
+        self.adapter_path = (
+            _prepare_adapter_path(
+                adapter_path
+            )
+        )
 
-        print(f"Loading Adaptive-RAG complexity evaluator: {model_name}")
-        print(f"Device: {self.device}")
+        print(
+            "\nLoading Adaptive-RAG complexity evaluator"
+        )
 
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        print(
+            "Base model:",
+            self.base_model_name,
+        )
 
-        self.model = AutoModelForSeq2SeqLM.from_pretrained(
-            model_name
-        ).to(self.device)
+        print(
+            "LoRA adapter:",
+            self.adapter_path,
+        )
+
+        # The classifier was trained on raw question text.
+        # Therefore we deliberately DO NOT prepend:
+        #
+        # "Classify the complexity of the following query:"
+        #
+        # here.
+        self.tokenizer = (
+            AutoTokenizer.from_pretrained(
+                self.base_model_name
+            )
+        )
+
+        if load_in_4bit:
+            dtype = _dtype_from_name(
+                compute_dtype
+            )
+
+            quantization_config = (
+                BitsAndBytesConfig(
+                    load_in_4bit=True,
+                    bnb_4bit_quant_type="nf4",
+                    bnb_4bit_use_double_quant=True,
+                    bnb_4bit_compute_dtype=dtype,
+                )
+            )
+
+            base_model = (
+                AutoModelForSeq2SeqLM.from_pretrained(
+                    self.base_model_name,
+                    quantization_config=quantization_config,
+                    device_map="auto",
+                )
+            )
+
+        else:
+            base_model = (
+                AutoModelForSeq2SeqLM.from_pretrained(
+                    self.base_model_name,
+                    device_map="auto",
+                )
+            )
+
+        self.model = PeftModel.from_pretrained(
+            base_model,
+            str(self.adapter_path),
+            is_trainable=False,
+        )
 
         self.model.eval()
 
-    # ------------------------------------------------------------------
-    # Prompt
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def build_prompt(question: str) -> str:
-        """
-        Build the query-complexity classification prompt.
-
-        This follows the usage described for the available pretrained
-        Adaptive-RAG checkpoint.
-        """
-
-        return (
-            "Classify the complexity of the following query: "
-            f"{question.strip()}"
+        print(
+            "✓ Adaptive-RAG LoRA classifier loaded."
         )
 
-    # ------------------------------------------------------------------
-    # Sequence likelihood
-    # ------------------------------------------------------------------
+    @property
+    def device(self):
+        return next(
+            self.model.parameters()
+        ).device
 
     @torch.no_grad()
-    def _label_log_likelihood(
+    def _class_log_scores(
         self,
-        encoded_question: Dict[str, torch.Tensor],
-        label: str,
+        question: str,
     ) -> torch.Tensor:
-        """
-        Compute log P(label | question).
+        """Compute sequence log-likelihood for A, B and C.
 
-        Rather than looking only at a single decoder token, we score the
-        complete target sequence produced by the tokenizer.
-
-        This is more robust because T5 is a sequence-to-sequence model.
+        We score the complete output sequence for each class instead
+        of assuming that A/B/C correspond to a particular single
+        tokenizer ID.
         """
 
-        target = self.tokenizer(
-            label,
+        question = str(question).strip()
+
+        if not question:
+            raise ValueError(
+                "Question cannot be empty."
+            )
+
+        inputs = self.tokenizer(
+            question,
             return_tensors="pt",
-            add_special_tokens=True,
+            max_length=self.max_input_length,
+            truncation=True,
         )
 
-        labels = target["input_ids"].to(self.device)
+        labels = self.tokenizer(
+            text_target=list(LABELS),
+            return_tensors="pt",
+            padding=True,
+        )["input_ids"]
+
+        batch_size = len(LABELS)
+
+        input_ids = inputs[
+            "input_ids"
+        ].repeat(
+            batch_size,
+            1,
+        )
+
+        attention_mask = inputs[
+            "attention_mask"
+        ].repeat(
+            batch_size,
+            1,
+        )
+
+        input_ids = input_ids.to(
+            self.device
+        )
+
+        attention_mask = attention_mask.to(
+            self.device
+        )
+
+        labels = labels.to(
+            self.device
+        )
+
+        decoder_input_ids = (
+            self.model.prepare_decoder_input_ids_from_labels(
+                labels=labels
+            )
+        )
 
         outputs = self.model(
-            input_ids=encoded_question["input_ids"],
-            attention_mask=encoded_question["attention_mask"],
-            labels=labels,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            decoder_input_ids=decoder_input_ids,
+            use_cache=False,
         )
 
         logits = outputs.logits
 
-        # logits:
-        # [batch_size, target_length, vocabulary_size]
-        #
-        # labels:
-        # [batch_size, target_length]
-
-        log_probs = F.log_softmax(logits, dim=-1)
-
-        token_log_probs = torch.gather(
-            log_probs,
+        log_probs = torch.log_softmax(
+            logits,
             dim=-1,
-            index=labels.unsqueeze(-1),
-        ).squeeze(-1)
-
-        # Ignore padding if any exists.
-        valid_mask = labels.ne(self.tokenizer.pad_token_id)
-
-        sequence_log_prob = (
-            token_log_probs * valid_mask
-        ).sum(dim=-1)
-
-        return sequence_log_prob.squeeze(0)
-
-    # ------------------------------------------------------------------
-    # Complexity evaluation
-    # ------------------------------------------------------------------
-
-    @torch.no_grad()
-    def evaluate(self, question: str) -> ComplexityResult:
-        """
-        Evaluate one question.
-
-        Returns
-        -------
-        ComplexityResult
-            predicted_class
-            p_A
-            p_B
-            p_C
-            E
-        """
-
-        prompt = self.build_prompt(question)
-
-        encoded_question = self.tokenizer(
-            prompt,
-            return_tensors="pt",
-            truncation=True,
-            max_length=self.max_input_length,
         )
 
-        encoded_question = {
-            key: value.to(self.device)
-            for key, value in encoded_question.items()
-        }
+        safe_labels = labels.clone()
 
-        # --------------------------------------------------------------
-        # Score each allowed Adaptive-RAG output.
-        # --------------------------------------------------------------
+        mask = (
+            safe_labels
+            != self.tokenizer.pad_token_id
+        )
 
-        label_scores = []
+        safe_labels[
+            ~mask
+        ] = 0
 
-        for label in self.LABELS:
-            score = self._label_log_likelihood(
-                encoded_question,
-                label,
+        token_log_probs = (
+            log_probs.gather(
+                dim=-1,
+                index=safe_labels.unsqueeze(-1),
             )
+            .squeeze(-1)
+        )
 
-            label_scores.append(score)
+        token_log_probs = (
+            token_log_probs
+            * mask
+        )
 
-        label_scores = torch.stack(label_scores)
+        sequence_scores = (
+            token_log_probs.sum(
+                dim=-1
+            )
+        )
 
-        # Convert the three sequence scores into probabilities restricted
-        # to the allowed classes A/B/C.
-        probabilities = F.softmax(
-            label_scores,
+        return sequence_scores
+
+    @torch.no_grad()
+    def evaluate(
+        self,
+        question: str,
+    ) -> ComplexityResult:
+        """Evaluate one question."""
+
+        scores = self._class_log_scores(
+            question
+        )
+
+        probabilities = torch.softmax(
+            scores.float(),
             dim=0,
         )
 
-        p_A = probabilities[0].item()
-        p_B = probabilities[1].item()
-        p_C = probabilities[2].item()
+        p_A = float(
+            probabilities[0].item()
+        )
 
-        predicted_index = torch.argmax(probabilities).item()
+        p_B = float(
+            probabilities[1].item()
+        )
 
-        predicted_class = self.LABELS[predicted_index]
+        p_C = float(
+            probabilities[2].item()
+        )
 
-        # --------------------------------------------------------------
-        # Replication assumption:
-        #
-        # A = 0
-        # B = 0.5
-        # C = 1
-        #
-        # E = expectation over the ordinal complexity scale.
-        # --------------------------------------------------------------
+        predicted_index = int(
+            torch.argmax(
+                probabilities
+            ).item()
+        )
+
+        predicted_class = (
+            LABELS[predicted_index]
+        )
 
         E = (
-            self.LABEL_VALUES["A"] * p_A
-            + self.LABEL_VALUES["B"] * p_B
-            + self.LABEL_VALUES["C"] * p_C
+            LABEL_VALUES["A"] * p_A
+            + LABEL_VALUES["B"] * p_B
+            + LABEL_VALUES["C"] * p_C
         )
 
         return ComplexityResult(
@@ -281,39 +470,64 @@ class AdaptiveRAGComplexityEvaluator:
             p_A=p_A,
             p_B=p_B,
             p_C=p_C,
-            E=E,
+            E=float(E),
         )
 
+    def __call__(
+        self,
+        question: str,
+    ) -> ComplexityResult:
+        return self.evaluate(
+            question
+        )
 
-# ----------------------------------------------------------------------
-# Simple standalone test
-# ----------------------------------------------------------------------
+    @classmethod
+    def from_config(
+        cls,
+        config: dict,
+        adapter_path: Optional[str] = None,
+        base_model_name: Optional[str] = None,
+    ):
+        """Build evaluator directly from default.yaml."""
 
-if __name__ == "__main__":
+        complexity_config = config.get(
+            "complexity",
+            {},
+        )
 
-    evaluator = AdaptiveRAGComplexityEvaluator()
+        resolved_adapter = (
+            adapter_path
+            or complexity_config.get(
+                "adapter_path"
+            )
+        )
 
-    examples = [
-        "What is the capital of France?",
-        "Who wrote Hamlet?",
-        (
-            "Which country hosted the Olympic Games immediately after "
-            "the country whose capital is Athens?"
-        ),
-    ]
+        if not resolved_adapter:
+            raise ValueError(
+                "No complexity.adapter_path was provided."
+            )
 
-    for question in examples:
+        resolved_base_model = (
+            base_model_name
+            or complexity_config.get(
+                "base_model_name",
+                DEFAULT_ADAPTIVE_RAG_BASE_MODEL,
+            )
+        )
 
-        result = evaluator.evaluate(question)
-
-        print("\n" + "=" * 80)
-        print("QUESTION")
-        print("=" * 80)
-        print(question)
-
-        print("\nComplexity prediction:")
-        print(f"  class = {result.predicted_class}")
-        print(f"  P(A)  = {result.p_A:.4f}")
-        print(f"  P(B)  = {result.p_B:.4f}")
-        print(f"  P(C)  = {result.p_C:.4f}")
-        print(f"  E     = {result.E:.4f}")
+        return cls(
+            adapter_path=resolved_adapter,
+            base_model_name=resolved_base_model,
+            max_input_length=complexity_config.get(
+                "max_input_length",
+                384,
+            ),
+            load_in_4bit=complexity_config.get(
+                "load_in_4bit",
+                True,
+            ),
+            compute_dtype=complexity_config.get(
+                "compute_dtype",
+                "auto",
+            ),
+        )
