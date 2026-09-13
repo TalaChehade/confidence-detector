@@ -4,11 +4,12 @@ Run the live INKER IE-KRT retrieval-trigger experiment.
 This experiment combines the two signals used by the INKER retrieval trigger:
 
     1. External query complexity E
-       --------------------------------
-       Estimated using an Adaptive-RAG-style T5-Large complexity evaluator.
+       ---------------------------
+       Estimated using a T5-Large Adaptive-RAG-style query-complexity
+       classifier adapted with LoRA and loaded in 4-bit NF4.
 
     2. Internal token confidence m_tilde_i
-       ------------------------------------
+       -----------------------------------
        Estimated from Mistral hidden representations using the trained
        confidence representation reader.
 
@@ -33,9 +34,11 @@ Retrieval is triggered when:
 
 for the first qualifying generated token.
 
-Because ``generation.py`` performs token-by-token autoregressive generation,
-the trigger is evaluated LIVE. If ``stop_on_trigger=True``, generation stops
-as soon as the first retrieval trigger is detected.
+Because generation.py performs token-by-token autoregressive generation,
+the trigger is evaluated LIVE.
+
+If stop_on_trigger=True, generation stops when the first retrieval trigger
+is detected.
 
 Important
 ---------
@@ -45,39 +48,49 @@ This script evaluates IE-KRT:
 
 It does NOT yet implement the complete INKER RAG pipeline.
 
-Specifically, after a trigger this experiment does not yet:
+After a trigger it does not yet:
 
     - formulate the retrieval query,
     - search an external corpus,
     - rerank retrieved evidence,
     - inject evidence into the prompt,
-    - or resume/restart generation.
+    - or resume generation.
 
-Those operations belong to the IE-KQF and retrieval portions of INKER.
+Those operations belong to the IE-KQF and retrieval stages.
 
-Complexity evaluator
---------------------
-The primary replication uses the pretrained third-party Adaptive-RAG
-T5-Large reproduction:
+External complexity evaluator
+-----------------------------
+The current proof-of-concept uses:
 
-    LenckCuak/Adaptive-RAG
+    T5-Large
+        +
+    4-bit NF4 base-model loading
+        +
+    locally trained Adaptive-RAG LoRA adapter
 
-rather than retraining Adaptive-RAG from scratch.
+The classifier predicts:
 
-The conversion from A/B/C probabilities into continuous query complexity E
-is the replication assumption implemented in ``inker.complexity``:
+    A = no retrieval
+    B = single-step retrieval
+    C = multi-step retrieval
+
+The class probabilities are converted into a continuous external
+complexity score using the replication assumption:
 
     A -> 0.0
     B -> 0.5
     C -> 1.0
 
-and:
+therefore:
 
-    E = 0.0 P(A) + 0.5 P(B) + 1.0 P(C)
+    E = 0.0 * P(A)
+        + 0.5 * P(B)
+        + 1.0 * P(C)
 
-      = 0.5 P(B) + P(C)
+      = 0.5 * P(B) + P(C)
 
-This assumption must be documented when reporting replication results.
+This mapping is a replication assumption and should not be presented
+as an exact formula released by the INKER authors.
 """
 
 from __future__ import annotations
@@ -102,7 +115,6 @@ from _common import (
 
 from inker.complexity import (
     AdaptiveRAGComplexityEvaluator,
-    DEFAULT_ADAPTIVE_RAG_MODEL,
 )
 
 from inker.generation import (
@@ -114,30 +126,17 @@ from inker.generation import (
 # Reproducibility
 # ==========================================================================
 
-def set_random_seed(
-    seed: int,
-) -> None:
+def set_random_seed(seed: int) -> None:
     """
     Seed Python, NumPy, and PyTorch.
     """
 
-    random.seed(
-        seed
-    )
-
-    np.random.seed(
-        seed
-    )
-
-    torch.manual_seed(
-        seed
-    )
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
 
     if torch.cuda.is_available():
-
-        torch.cuda.manual_seed_all(
-            seed
-        )
+        torch.cuda.manual_seed_all(seed)
 
 
 # ==========================================================================
@@ -153,26 +152,16 @@ def load_representation_reader(
     """
 
     if not reader_path.exists():
-
         raise FileNotFoundError(
             "Representation reader not found:\n"
             f"    {reader_path}\n\n"
             "Run experiments/train_detector.py first."
         )
 
-    with reader_path.open(
-        "rb"
-    ) as file:
+    with reader_path.open("rb") as file:
+        rep_reader = pickle.load(file)
 
-        rep_reader = pickle.load(
-            file
-        )
-
-    if not isinstance(
-        rep_reader,
-        dict,
-    ):
-
+    if not isinstance(rep_reader, dict):
         raise TypeError(
             "Representation reader must be a dictionary."
         )
@@ -183,28 +172,17 @@ def load_representation_reader(
         "signs",
     }
 
-    missing = (
-        required_components
-        - set(
-            rep_reader.keys()
-        )
-    )
+    missing = required_components - set(rep_reader.keys())
 
     if missing:
-
         raise KeyError(
             "Representation reader is missing required components: "
             f"{sorted(missing)}"
         )
 
     for layer in layers:
-
         for component in required_components:
-
-            if layer not in rep_reader[
-                component
-            ]:
-
+            if layer not in rep_reader[component]:
                 raise KeyError(
                     f"Representation reader does not contain "
                     f"layer {layer} in '{component}'.\n"
@@ -229,9 +207,7 @@ def load_questions_from_file(
     Supported formats
     -----------------
     CSV
-        Requires a column such as:
-
-            question
+        Requires a question column.
 
     JSON
         Either:
@@ -249,22 +225,18 @@ def load_questions_from_file(
             ]
 
     JSONL
-        One JSON object per line.
+        One JSON object or string per line.
 
     TXT
         One question per non-empty line.
     """
 
     if not path.exists():
-
         raise FileNotFoundError(
             f"Question file not found: {path}"
         )
 
-    suffix = (
-        path.suffix
-        .lower()
-    )
+    suffix = path.suffix.lower()
 
     questions: List[str] = []
 
@@ -274,12 +246,9 @@ def load_questions_from_file(
 
     if suffix == ".csv":
 
-        df = pd.read_csv(
-            path
-        )
+        df = pd.read_csv(path)
 
         if question_column not in df.columns:
-
             raise KeyError(
                 f"CSV does not contain question column "
                 f"{question_column!r}. "
@@ -287,9 +256,7 @@ def load_questions_from_file(
             )
 
         questions = (
-            df[
-                question_column
-            ]
+            df[question_column]
             .dropna()
             .astype(str)
             .tolist()
@@ -305,53 +272,31 @@ def load_questions_from_file(
             "r",
             encoding="utf-8",
         ) as file:
+            data = json.load(file)
 
-            data = json.load(
-                file
-            )
-
-        if not isinstance(
-            data,
-            list,
-        ):
-
+        if not isinstance(data, list):
             raise ValueError(
                 "JSON question file must contain a list."
             )
 
         for item in data:
 
-            if isinstance(
-                item,
-                str,
-            ):
+            if isinstance(item, str):
+                questions.append(item)
 
-                questions.append(
-                    item
-                )
-
-            elif isinstance(
-                item,
-                dict,
-            ):
+            elif isinstance(item, dict):
 
                 if question_column not in item:
-
                     raise KeyError(
                         f"JSON object is missing "
                         f"{question_column!r}."
                     )
 
                 questions.append(
-                    str(
-                        item[
-                            question_column
-                        ]
-                    )
+                    str(item[question_column])
                 )
 
             else:
-
                 raise TypeError(
                     "JSON question entries must be strings "
                     "or dictionaries."
@@ -373,48 +318,29 @@ def load_questions_from_file(
                 start=1,
             ):
 
-                line = (
-                    line.strip()
-                )
+                line = line.strip()
 
                 if not line:
                     continue
 
-                item = json.loads(
-                    line
-                )
+                item = json.loads(line)
 
-                if isinstance(
-                    item,
-                    str,
-                ):
+                if isinstance(item, str):
+                    questions.append(item)
 
-                    questions.append(
-                        item
-                    )
-
-                elif isinstance(
-                    item,
-                    dict,
-                ):
+                elif isinstance(item, dict):
 
                     if question_column not in item:
-
                         raise KeyError(
                             f"Line {line_number}: missing "
                             f"{question_column!r}."
                         )
 
                     questions.append(
-                        str(
-                            item[
-                                question_column
-                            ]
-                        )
+                        str(item[question_column])
                     )
 
                 else:
-
                     raise TypeError(
                         f"Line {line_number}: expected string "
                         "or dictionary."
@@ -438,7 +364,6 @@ def load_questions_from_file(
             ]
 
     else:
-
         raise ValueError(
             "Unsupported question-file format. "
             "Supported extensions are: "
@@ -446,7 +371,7 @@ def load_questions_from_file(
         )
 
     # ------------------------------------------------------------------
-    # Final cleanup.
+    # Final cleanup
     # ------------------------------------------------------------------
 
     questions = [
@@ -456,7 +381,6 @@ def load_questions_from_file(
     ]
 
     if not questions:
-
         raise ValueError(
             f"No usable questions found in {path}."
         )
@@ -469,26 +393,35 @@ def load_questions_from_file(
 # ==========================================================================
 
 def build_complexity_evaluator(
-    model_name: str = DEFAULT_ADAPTIVE_RAG_MODEL,
+    config: dict,
+    adapter_path: str | None = None,
 ):
     """
-    Load the Adaptive-RAG-style query complexity evaluator.
+    Load the T5-Large + 4-bit + LoRA Adaptive-RAG complexity evaluator.
+
+    Parameters
+    ----------
+    config:
+        Repository YAML configuration.
+
+    adapter_path:
+        Optional CLI override.
+
+        If omitted, complexity.adapter_path is read from the config.
 
     Returns
     -------
-    evaluator
-        ``AdaptiveRAGComplexityEvaluator`` instance.
+    evaluator:
+        AdaptiveRAGComplexityEvaluator instance.
 
-    complexity_fn
-        Callable accepted by ``generation.answer_with_confidence``.
-
-        The callable receives a question and returns the complexity result
-        produced by the evaluator.
+    complexity_fn:
+        Callable accepted by generation.answer_with_confidence().
     """
 
     evaluator = (
-        AdaptiveRAGComplexityEvaluator(
-            model_name=model_name
+        AdaptiveRAGComplexityEvaluator.from_config(
+            config=config,
+            adapter_path=adapter_path,
         )
     )
 
@@ -499,10 +432,7 @@ def build_complexity_evaluator(
             question
         )
 
-    return (
-        evaluator,
-        complexity_fn,
-    )
+    return evaluator, complexity_fn
 
 
 # ==========================================================================
@@ -515,7 +445,7 @@ def evaluate_questions(
     model: Any,
     rep_reader: Dict[str, Any],
     layers: Sequence[int],
-    complexity_fn,
+    complexity_evaluator: AdaptiveRAGComplexityEvaluator,
     trigger_threshold: float,
     confidence_threshold: float,
     max_new_tokens: int,
@@ -526,34 +456,33 @@ def evaluate_questions(
     """
     Run live IE-KRT generation over a collection of questions.
 
-    Each question receives:
+    For each question:
 
-        E
-            query complexity
+        1. Compute Adaptive-RAG complexity once.
 
-        m_i
-            raw internal confidence per generated token
+        2. Obtain:
+               P(A)
+               P(B)
+               P(C)
+               E
 
-        m_tilde_i
-            causal normalized confidence
+        3. Cache that complexity result.
 
-        s_i
-            token content mask
+        4. Generate tokens using Mistral.
 
-        K(t_i)
-            retrieval activation
+        5. For every generated token compute:
+               m_i
+               m_tilde_i
+               s_i
+               K(t_i)
 
-        triggered
-            whether retrieval fired
+        6. Trigger when:
+               K(t_i) > tau
     """
 
-    results: List[
-        Dict[str, Any]
-    ] = []
+    results: List[Dict[str, Any]] = []
 
-    total = len(
-        questions
-    )
+    total = len(questions)
 
     for index, question in enumerate(
         questions,
@@ -561,11 +490,60 @@ def evaluate_questions(
     ):
 
         if verbose:
+            print(
+                f"\n[{index}/{total}] {question}"
+            )
+
+        # --------------------------------------------------------------
+        # External complexity is question-level.
+        #
+        # Compute it ONCE rather than re-running T5 during token
+        # generation.
+        # --------------------------------------------------------------
+
+        complexity = complexity_evaluator.evaluate(
+            question
+        )
+
+        if verbose:
 
             print(
-                f"\n[{index}/{total}] "
-                f"{question}"
+                f"    Complexity class = "
+                f"{complexity.predicted_class}"
             )
+
+            print(
+                f"    P(A) = {complexity.p_A:.4f}"
+            )
+
+            print(
+                f"    P(B) = {complexity.p_B:.4f}"
+            )
+
+            print(
+                f"    P(C) = {complexity.p_C:.4f}"
+            )
+
+            print(
+                f"    E = {complexity.E:.4f}"
+            )
+
+        # --------------------------------------------------------------
+        # Cache result.
+        #
+        # answer_with_confidence expects a callable, but E is constant
+        # for the entire generated answer.
+        # --------------------------------------------------------------
+
+        def complexity_fn(
+            _question: str,
+            cached=complexity,
+        ):
+            return cached
+
+        # --------------------------------------------------------------
+        # Live token-by-token IE-KRT generation.
+        # --------------------------------------------------------------
 
         result = answer_with_confidence(
             question=question,
@@ -582,26 +560,29 @@ def evaluate_questions(
             verbose=False,
         )
 
-        results.append(
-            result
+        # --------------------------------------------------------------
+        # Ensure the complete complexity result is saved.
+        # --------------------------------------------------------------
+
+        result["complexity"] = (
+            complexity.to_dict()
         )
 
-        if verbose:
+        result["E"] = float(
+            complexity.E
+        )
 
-            print(
-                f"    E = "
-                f"{float(result['E']):.4f}"
-            )
+        results.append(result)
+
+        if verbose:
 
             print(
                 "    Retrieval triggered = "
                 f"{bool(result.get('triggered', False))}"
             )
 
-            trigger_token = (
-                result.get(
-                    "trigger_token"
-                )
+            trigger_token = result.get(
+                "trigger_token"
             )
 
             if trigger_token is not None:
@@ -615,7 +596,7 @@ def evaluate_questions(
 
 
 # ==========================================================================
-# Result conversion
+# Result helpers
 # ==========================================================================
 
 def _get_token_entries(
@@ -624,24 +605,17 @@ def _get_token_entries(
     """
     Retrieve token-level records from a generation result.
 
-    ``generation.py`` may expose them as ``token_entries`` or
-    ``token_history`` depending on the final repository naming.
+    Temporary compatibility is retained for:
 
-    This small compatibility helper prevents CSV export from depending on
-    only one of those names.
+        token_entries
+        token_history
     """
 
     if "token_entries" in result:
-
-        return result[
-            "token_entries"
-        ]
+        return result["token_entries"]
 
     if "token_history" in result:
-
-        return result[
-            "token_history"
-        ]
+        return result["token_history"]
 
     return []
 
@@ -657,20 +631,14 @@ def _safe_mean(
         float(value)
         for value in values
         if value is not None
-        and np.isfinite(
-            float(value)
-        )
+        and np.isfinite(float(value))
     ]
 
     if not values:
-        return float(
-            "nan"
-        )
+        return float("nan")
 
     return float(
-        np.mean(
-            values
-        )
+        np.mean(values)
     )
 
 
@@ -685,20 +653,14 @@ def _safe_min(
         float(value)
         for value in values
         if value is not None
-        and np.isfinite(
-            float(value)
-        )
+        and np.isfinite(float(value))
     ]
 
     if not values:
-        return float(
-            "nan"
-        )
+        return float("nan")
 
     return float(
-        np.min(
-            values
-        )
+        np.min(values)
     )
 
 
@@ -713,22 +675,20 @@ def _safe_max(
         float(value)
         for value in values
         if value is not None
-        and np.isfinite(
-            float(value)
-        )
+        and np.isfinite(float(value))
     ]
 
     if not values:
-        return float(
-            "nan"
-        )
+        return float("nan")
 
     return float(
-        np.max(
-            values
-        )
+        np.max(values)
     )
 
+
+# ==========================================================================
+# Result conversion
+# ==========================================================================
 
 def results_to_dataframes(
     results: Sequence[Dict[str, Any]],
@@ -747,26 +707,18 @@ def results_to_dataframes(
         results
     ):
 
-        token_entries = (
-            _get_token_entries(
-                result
-            )
+        token_entries = _get_token_entries(
+            result
         )
 
         m_tilde_values = [
-            entry.get(
-                "m_tilde"
-            )
-            for entry
-            in token_entries
+            entry.get("m_tilde")
+            for entry in token_entries
         ]
 
         K_values = [
-            entry.get(
-                "K"
-            )
-            for entry
-            in token_entries
+            entry.get("K")
+            for entry in token_entries
         ]
 
         content_entries = [
@@ -780,16 +732,9 @@ def results_to_dataframes(
             ) == 1
         ]
 
-        complexity_result = (
-            result.get(
-                "complexity"
-            )
+        complexity_result = result.get(
+            "complexity"
         )
-
-        # --------------------------------------------------------------
-        # Complexity class/probabilities may either be available in a
-        # nested dictionary or only as E.
-        # --------------------------------------------------------------
 
         complexity_class = None
         p_A = np.nan
@@ -832,19 +777,16 @@ def results_to_dataframes(
             )
         )
 
-        trigger_token = (
-            result.get(
-                "trigger_token"
-            )
+        trigger_token = result.get(
+            "trigger_token"
         )
 
-        trigger_index = (
-            result.get(
-                "trigger_index"
-            )
+        trigger_index = result.get(
+            "trigger_index"
         )
 
         question_rows.append({
+
             "question_index":
                 question_index,
 
@@ -877,9 +819,7 @@ def results_to_dataframes(
 
             "E":
                 float(
-                    result[
-                        "E"
-                    ]
+                    result["E"]
                 ),
 
             "n_generated_tokens":
@@ -923,7 +863,7 @@ def results_to_dataframes(
         })
 
         # --------------------------------------------------------------
-        # Token-level rows.
+        # Token-level rows
         # --------------------------------------------------------------
 
         for fallback_index, entry in enumerate(
@@ -931,6 +871,7 @@ def results_to_dataframes(
         ):
 
             token_rows.append({
+
                 "question_index":
                     question_index,
 
@@ -940,11 +881,21 @@ def results_to_dataframes(
                         "",
                     ),
 
+                "complexity_class":
+                    complexity_class,
+
+                "p_A":
+                    p_A,
+
+                "p_B":
+                    p_B,
+
+                "p_C":
+                    p_C,
+
                 "E":
                     float(
-                        result[
-                            "E"
-                        ]
+                        result["E"]
                     ),
 
                 "token_index":
@@ -1065,9 +1016,7 @@ def save_results(
     ) as file:
 
         json.dump(
-            list(
-                results
-            ),
+            list(results),
             file,
             ensure_ascii=False,
             indent=2,
@@ -1134,7 +1083,7 @@ def print_summary(
         return
 
     # ------------------------------------------------------------------
-    # Complexity.
+    # Complexity
     # ------------------------------------------------------------------
 
     print(
@@ -1162,7 +1111,32 @@ def print_summary(
     )
 
     # ------------------------------------------------------------------
-    # Retrieval triggers.
+    # Complexity class counts
+    # ------------------------------------------------------------------
+
+    if "complexity_class" in question_df.columns:
+
+        print(
+            "\nAdaptive-RAG predicted classes:"
+        )
+
+        counts = (
+            question_df[
+                "complexity_class"
+            ]
+            .value_counts(
+                dropna=False
+            )
+        )
+
+        for label, count in counts.items():
+
+            print(
+                f"  {label}: {count}"
+            )
+
+    # ------------------------------------------------------------------
+    # Retrieval triggers
     # ------------------------------------------------------------------
 
     n_triggered = int(
@@ -1192,15 +1166,13 @@ def print_summary(
     )
 
     # ------------------------------------------------------------------
-    # Token statistics.
+    # Token statistics
     # ------------------------------------------------------------------
 
     if not token_df.empty:
 
         content_tokens = token_df[
-            token_df[
-                "s_i"
-            ] == 1
+            token_df["s_i"] == 1
         ]
 
         print(
@@ -1234,17 +1206,14 @@ def print_summary(
                 f"{content_tokens['K'].max():.4f}"
             )
 
-            # Note:
-            #
             # K > 0 does NOT mean retrieval.
+            #
             # Retrieval specifically requires:
             #
             #     K > tau
-            #
+
             above_threshold = (
-                content_tokens[
-                    "K"
-                ]
+                content_tokens["K"]
                 > trigger_threshold
             )
 
@@ -1268,14 +1237,14 @@ def main(
     questions_path: str | Path | None = None,
     question: str | None = None,
     num_questions: int | None = None,
-    complexity_model: str = DEFAULT_ADAPTIVE_RAG_MODEL,
+    complexity_adapter: str | None = None,
 ) -> None:
     """
     Run the live INKER retrieval-trigger experiment.
     """
 
     # ------------------------------------------------------------------
-    # 1. Configuration and seed.
+    # 1. Configuration and seed
     # ------------------------------------------------------------------
 
     config = get_config(
@@ -1295,30 +1264,21 @@ def main(
     )
 
     # ------------------------------------------------------------------
-    # 2. Detector configuration.
+    # 2. Detector configuration
     # ------------------------------------------------------------------
 
     layers = get_detector_layers(
         config
     )
 
-    detector_config = config[
-        "detector"
-    ]
-
-    # ------------------------------------------------------------------
-    # Retrieval trigger and confidence-only thresholds are intentionally
-    # separate concepts.
-    # ------------------------------------------------------------------
-
     trigger_config = config.get(
         "trigger",
-        {}
+        {},
     )
 
     confidence_config = config.get(
         "confidence",
-        {}
+        {},
     )
 
     trigger_threshold = float(
@@ -1335,9 +1295,10 @@ def main(
         )
     )
 
-    generation_config = config[
-        "generation"
-    ]
+    generation_config = config.get(
+        "generation",
+        {},
+    )
 
     max_new_tokens = int(
         generation_config.get(
@@ -1361,66 +1322,23 @@ def main(
     )
 
     # ------------------------------------------------------------------
-    # 3. Load Mistral.
-    # ------------------------------------------------------------------
-
-    print(
-        "Loading base language model..."
-    )
-
-    tokenizer, model = (
-        load_configured_model(
-            config
-        )
-    )
-
-    # ------------------------------------------------------------------
-    # 4. Load confidence representation reader.
-    # ------------------------------------------------------------------
-
-    reader_path = get_project_path(
-        config,
-        "representation_reader",
-    )
-
-    rep_reader = (
-        load_representation_reader(
-            reader_path=reader_path,
-            layers=layers,
-        )
-    )
-
-    # ------------------------------------------------------------------
-    # 5. Load Adaptive-RAG complexity evaluator.
-    # ------------------------------------------------------------------
-
-    print(
-        "Loading query-complexity evaluator..."
-    )
-
-    print(
-        f"  {complexity_model}"
-    )
-
-    (
-        _complexity_evaluator,
-        complexity_fn,
-    ) = build_complexity_evaluator(
-        model_name=complexity_model
-    )
-
-    # ------------------------------------------------------------------
-    # 6. Load real questions.
+    # 3. Load questions FIRST
     #
-    # DO NOT use the confidence-detector contrastive statement dataset
-    # here. That dataset exists to train/evaluate the internal detector,
-    # not to evaluate query complexity or INKER retrieval behavior.
+    # This is done before loading the large models so bad input paths are
+    # detected immediately.
     # ------------------------------------------------------------------
 
     if question is not None:
 
+        cleaned_question = question.strip()
+
+        if not cleaned_question:
+            raise ValueError(
+                "--question cannot be empty."
+            )
+
         questions = [
-            question.strip()
+            cleaned_question
         ]
 
     elif questions_path is not None:
@@ -1445,7 +1363,6 @@ def main(
     if num_questions is not None:
 
         if num_questions <= 0:
-
             raise ValueError(
                 "--num-questions must be greater than zero."
             )
@@ -1455,13 +1372,107 @@ def main(
         ]
 
     print(
-        f"\nEvaluating "
-        f"{len(questions)} questions..."
+        f"\nQuestions to evaluate: "
+        f"{len(questions)}"
     )
 
     # ------------------------------------------------------------------
-    # 7. Live IE-KRT evaluation.
+    # 4. Load Mistral
     # ------------------------------------------------------------------
+
+    print(
+        "\nLoading base language model..."
+    )
+
+    tokenizer, model = (
+        load_configured_model(
+            config
+        )
+    )
+
+    # ------------------------------------------------------------------
+    # 5. Load confidence representation reader
+    # ------------------------------------------------------------------
+
+    reader_path = get_project_path(
+        config,
+        "representation_reader",
+    )
+
+    rep_reader = (
+        load_representation_reader(
+            reader_path=reader_path,
+            layers=layers,
+        )
+    )
+
+    print(
+        "✓ Confidence representation reader loaded."
+    )
+
+    # ------------------------------------------------------------------
+    # 6. Load Adaptive-RAG complexity evaluator
+    # ------------------------------------------------------------------
+
+    complexity_config = config.get(
+        "complexity",
+        {},
+    )
+
+    configured_adapter = (
+        complexity_config.get(
+            "adapter_path"
+        )
+    )
+
+    resolved_adapter = (
+        complexity_adapter
+        if complexity_adapter is not None
+        else configured_adapter
+    )
+
+    if not resolved_adapter:
+        raise ValueError(
+            "No Adaptive-RAG LoRA adapter configured.\n\n"
+            "Set:\n"
+            "  complexity.adapter_path\n\n"
+            "in configs/default.yaml or pass:\n"
+            "  --complexity-adapter PATH"
+        )
+
+    print(
+        "\nLoading query-complexity evaluator..."
+    )
+
+    print(
+        f"  Base model: "
+        f"{complexity_config.get('base_model_name', 't5-large')}"
+    )
+
+    print(
+        f"  Adapter: {resolved_adapter}"
+    )
+
+    print(
+        f"  4-bit: "
+        f"{complexity_config.get('load_in_4bit', True)}"
+    )
+
+    complexity_evaluator, _ = (
+        build_complexity_evaluator(
+            config=config,
+            adapter_path=resolved_adapter,
+        )
+    )
+
+    # ------------------------------------------------------------------
+    # 7. Live IE-KRT evaluation
+    # ------------------------------------------------------------------
+
+    print(
+        f"\nEvaluating "
+        f"{len(questions)} questions..."
+    )
 
     results = evaluate_questions(
         questions=questions,
@@ -1469,7 +1480,7 @@ def main(
         model=model,
         rep_reader=rep_reader,
         layers=layers,
-        complexity_fn=complexity_fn,
+        complexity_evaluator=complexity_evaluator,
         trigger_threshold=trigger_threshold,
         confidence_threshold=confidence_threshold,
         max_new_tokens=max_new_tokens,
@@ -1479,7 +1490,7 @@ def main(
     )
 
     # ------------------------------------------------------------------
-    # 8. Save.
+    # 8. Save
     # ------------------------------------------------------------------
 
     result_dir = get_project_path(
@@ -1495,7 +1506,7 @@ def main(
     )
 
     # ------------------------------------------------------------------
-    # 9. Summary.
+    # 9. Summary
     # ------------------------------------------------------------------
 
     print_summary(
@@ -1538,7 +1549,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description=(
             "Run the live INKER IE-KRT "
-            "confidence + query-complexity retrieval trigger."
+            "confidence + Adaptive-RAG complexity retrieval trigger."
         )
     )
 
@@ -1586,12 +1597,13 @@ if __name__ == "__main__":
     )
 
     parser.add_argument(
-        "--complexity-model",
+        "--complexity-adapter",
         type=str,
-        default=DEFAULT_ADAPTIVE_RAG_MODEL,
+        default=None,
         help=(
-            "Adaptive-RAG-style T5 model identifier. "
-            "Default: LenckCuak/Adaptive-RAG"
+            "Optional override for the Adaptive-RAG LoRA adapter. "
+            "May point to an extracted adapter folder or ZIP. "
+            "If omitted, complexity.adapter_path is read from config."
         ),
     )
 
@@ -1602,5 +1614,5 @@ if __name__ == "__main__":
         questions_path=args.questions,
         question=args.question,
         num_questions=args.num_questions,
-        complexity_model=args.complexity_model,
+        complexity_adapter=args.complexity_adapter,
     )
