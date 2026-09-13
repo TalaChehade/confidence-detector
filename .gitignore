@@ -1,25 +1,45 @@
+# =============================================================================
+# Model weights
+# =============================================================================
+
+models/**/*.safetensors
+models/**/*.bin
+models/**/*.pt
+models/**/*.pth
+models/**/*.zip
+
+adaptive_rag_t5_large_lora/
+adaptive_rag_t5_large_lora.zip
+
+# LoRA / local model checkpoints
+adapter_model.safetensors
+
+# Training checkpoints
+checkpoint-*/
+adaptive_rag_training/
+adaptive_rag_lora_checkpoints/
+
+# =============================================================================
+# Python
+# =============================================================================
+
 __pycache__/
 *.py[cod]
-.ipynb_checkpoints/
-.env
+*.egg-info/
+
+# =============================================================================
+# Environments
+# =============================================================================
+
 .venv/
 venv/
+env/
 
-# Secrets
-*.token
+# =============================================================================
+# IDE / OS
+# =============================================================================
 
-# Local model/data/results artifacts
-*.pkl
-*.pt
-*.pth
-*.bin
-*.safetensors
-
-# Optional local mirrors of Drive content
-datasets/
-models/
-results/
-logs/
-
+.vscode/
+.idea/
 .DS_Store
 Thumbs.db
