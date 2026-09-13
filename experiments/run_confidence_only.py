@@ -738,19 +738,18 @@ def main(
         )
 
         record = (
-            answer_with_confidence_only(
-                question=question,
-                expected_answer=expected_answer,
-                tokenizer=tokenizer,
-                model=model,
-                rep_reader=rep_reader,
-                layers=layers,
-                confidence_threshold=confidence_threshold,
-                max_new_tokens=max_new_tokens,
-                repetition_penalty=repetition_penalty,
-                verbose=False,
-            )
+        answer_with_confidence_only(
+            question=question,
+            expected_answer=expected_answer,
+            tokenizer=tokenizer,
+            model=model,
+            rep_reader=rep_reader,
+            layers=layers,
+            max_new_tokens=max_new_tokens,
+            repetition_penalty=repetition_penalty,
+            verbose=False,
         )
+    )
 
         # --------------------------------------------------------------
         # Support either final naming used by generation.py:
