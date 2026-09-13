@@ -1435,41 +1435,76 @@ After the repository has been validated end-to-end in Colab, the dependency vers
 
 # 23. Quick Command Reference
 
-Train the confidence detector:
+# Google Colab Commands
+
+## 1. Mount Google Drive
+
+```python
+from google.colab import drive
+drive.mount("/content/drive")
+```
+
+## 2. Clone the Repository
+
+```bash
+%cd /content
+!rm -rf confidence-detector
+!git clone https://github.com/TalaChehade/confidence-detector.git
+%cd /content/confidence-detector
+```
+
+## 3. Install Requirements
+
+```bash
+!pip install -q -r requirements.txt
+```
+
+## 4. Check GPU
+
+```bash
+!nvidia-smi
+```
+
+## 5. Train the Confidence Detector
 
 ```bash
 !python experiments/train_detector.py
 ```
 
-Evaluate the confidence detector:
+## 6. Evaluate the Confidence Detector
 
 ```bash
 !python experiments/evaluate_detector.py
 ```
 
-Test the external complexity evaluator:
+## 7. Test the External Complexity Evaluator
 
 ```bash
 !python experiments/test_complexity_evaluator.py
 ```
 
-Run confidence-only generation:
+## 8. Run Confidence-Only Generation
 
 ```bash
 !python experiments/run_confidence_only.py
 ```
 
-Inspect IE-KRT on one question:
+## 9. Inspect IE-KRT on One Question
 
 ```bash
 !python experiments/run_inker_trigger.py \
   --question "YOUR QUESTION HERE"
 ```
 
-Run the qualitative IE-KRT test suite:
+## 10. Run a Quick IE-KRT Test Suite
+
+```bash
+!python experiments/run_test_suite.py \
+  --num-tests 2
+```
+
+## 11. Run the Full Qualitative IE-KRT Test Suite
 
 ```bash
 !python experiments/run_test_suite.py
 ```
-
----
