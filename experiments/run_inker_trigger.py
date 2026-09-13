@@ -1,3 +1,4 @@
+
 """
 Run the live INKER IE-KRT retrieval-trigger experiment.
 
@@ -5,10 +6,23 @@ This script connects all components required for INKER's retrieval-trigger
 mechanism:
 
     1. Adaptive-RAG-style external query-complexity evaluator.
+
+       Current proof-of-concept implementation:
+
+           T5-Large
+               +
+           4-bit NF4 quantization
+               +
+           locally trained Adaptive-RAG LoRA adapter
+
     2. Trained internal confidence representation reader.
+
     3. Live token-by-token Mistral generation.
+
     4. Causal confidence normalization.
+
     5. Content-token masking.
+
     6. INKER activation:
 
            K(t_i) = (E - m_tilde_i) * s_i
@@ -38,6 +52,28 @@ In particular, this script does not yet:
     - or resume generation after retrieval.
 
 Those operations belong to the later IE-KQF / retrieval integration stage.
+
+External complexity
+-------------------
+The Adaptive-RAG classifier predicts:
+
+    A = no retrieval
+    B = single-step retrieval
+    C = multi-step retrieval
+
+For the current INKER replication, these probabilities are converted into
+continuous external complexity using:
+
+    E = 0.0 * P(A)
+        + 0.5 * P(B)
+        + 1.0 * P(C)
+
+which simplifies to:
+
+    E = 0.5 * P(B) + P(C)
+
+The A/B/C -> E mapping is a replication assumption rather than a claim about
+an exact continuous calibration formula released by the INKER authors.
 """
 
 from __future__ import annotations
@@ -57,7 +93,6 @@ from _common import (
 
 from inker.complexity import (
     AdaptiveRAGComplexityEvaluator,
-    DEFAULT_ADAPTIVE_RAG_MODEL,
 )
 
 from inker.generation import (
@@ -65,9 +100,9 @@ from inker.generation import (
 )
 
 
-# ==========================================================================
+# =============================================================================
 # CLI
-# ==========================================================================
+# =============================================================================
 
 def parse_args():
     """
@@ -98,12 +133,14 @@ def parse_args():
     )
 
     parser.add_argument(
-        "--complexity-model",
+        "--complexity-adapter",
         type=str,
-        default=DEFAULT_ADAPTIVE_RAG_MODEL,
+        default=None,
         help=(
-            "Adaptive-RAG-style T5 complexity model. "
-            f"Default: {DEFAULT_ADAPTIVE_RAG_MODEL}"
+            "Optional override for the locally trained Adaptive-RAG "
+            "LoRA adapter path. "
+            "May point to an adapter directory or ZIP file. "
+            "If omitted, complexity.adapter_path is read from the config."
         ),
     )
 
@@ -147,9 +184,9 @@ def parse_args():
     return parser.parse_args()
 
 
-# ==========================================================================
+# =============================================================================
 # Representation reader
-# ==========================================================================
+# =============================================================================
 
 def load_representation_reader(
     reader_path: Path,
@@ -214,15 +251,119 @@ def load_representation_reader(
 
                 raise KeyError(
                     f"Representation reader does not contain "
-                    f"layer {layer} in '{component}'."
+                    f"layer {layer} in '{component}'.\n"
+                    "Training and live generation must use the "
+                    "same detector layers."
                 )
 
     return rep_reader
 
 
-# ==========================================================================
+# =============================================================================
+# Complexity helpers
+# =============================================================================
+
+def complexity_to_dict(
+    complexity,
+) -> Dict[str, float | str]:
+    """
+    Convert a complexity result into a JSON-safe dictionary.
+
+    This helper avoids requiring ComplexityResult itself to implement
+    a to_dict() method.
+    """
+
+    return {
+        "predicted_class":
+            str(
+                complexity.predicted_class
+            ),
+
+        "p_A":
+            float(
+                complexity.p_A
+            ),
+
+        "p_B":
+            float(
+                complexity.p_B
+            ),
+
+        "p_C":
+            float(
+                complexity.p_C
+            ),
+
+        "E":
+            float(
+                complexity.E
+            ),
+    }
+
+
+def build_complexity_evaluator(
+    config: Dict[str, Any],
+    adapter_path: str | None = None,
+):
+    """
+    Construct the external Adaptive-RAG complexity evaluator.
+
+    The evaluator is built from:
+
+        t5-large
+            +
+        optional 4-bit NF4 loading
+            +
+        locally trained LoRA adapter
+
+    Parameters
+    ----------
+    config:
+        Complete repository configuration.
+
+    adapter_path:
+        Optional CLI override for complexity.adapter_path.
+    """
+
+    complexity_config = config.get(
+        "complexity",
+        {},
+    )
+
+    configured_adapter = complexity_config.get(
+        "adapter_path"
+    )
+
+    resolved_adapter = (
+        adapter_path
+        if adapter_path is not None
+        else configured_adapter
+    )
+
+    if not resolved_adapter:
+
+        raise ValueError(
+            "No Adaptive-RAG LoRA adapter path is configured.\n\n"
+            "Either set:\n\n"
+            "    complexity:\n"
+            "      adapter_path: /path/to/adapter.zip\n\n"
+            "inside configs/default.yaml, or pass:\n\n"
+            "    --complexity-adapter /path/to/adapter.zip"
+        )
+
+    evaluator = (
+        AdaptiveRAGComplexityEvaluator.from_config(
+            config=config,
+            adapter_path=resolved_adapter,
+        )
+    )
+
+    return evaluator, resolved_adapter
+
+
+# =============================================================================
 # Formatting helpers
-# ==========================================================================
+# =============================================================================
 
 def print_complexity_result(
     question: str,
@@ -435,9 +576,9 @@ def print_token_results(
         )
 
 
-# ==========================================================================
+# =============================================================================
 # Main
-# ==========================================================================
+# =============================================================================
 
 def main():
     """
@@ -446,9 +587,9 @@ def main():
 
     args = parse_args()
 
-    # ------------------------------------------------------------------
-    # 1. Load configuration.
-    # ------------------------------------------------------------------
+    # -------------------------------------------------------------------------
+    # 1. Load configuration
+    # -------------------------------------------------------------------------
 
     config = get_config(
         args.config
@@ -458,23 +599,23 @@ def main():
         config
     )
 
-    # ------------------------------------------------------------------
-    # 2. Resolve thresholds and generation settings.
-    # ------------------------------------------------------------------
+    # -------------------------------------------------------------------------
+    # 2. Resolve thresholds and generation settings
+    # -------------------------------------------------------------------------
 
     trigger_config = config.get(
         "trigger",
-        {}
+        {},
     )
 
     confidence_config = config.get(
         "confidence",
-        {}
+        {},
     )
 
     generation_config = config.get(
         "generation",
-        {}
+        {},
     )
 
     trigger_threshold = (
@@ -517,27 +658,22 @@ def main():
         )
     )
 
-    stop_on_trigger = (
-        not args.no_stop_on_trigger
-    )
-
-    # ------------------------------------------------------------------
-    # 3. Load Mistral model/tokenizer.
-    # ------------------------------------------------------------------
-
-    print(
-        "Loading base language model..."
-    )
-
-    tokenizer, model = (
-        load_configured_model(
-            config
+    configured_stop_on_trigger = bool(
+        trigger_config.get(
+            "stop_on_trigger",
+            True,
         )
     )
 
-    # ------------------------------------------------------------------
-    # 4. Load trained confidence detector.
-    # ------------------------------------------------------------------
+    stop_on_trigger = (
+        False
+        if args.no_stop_on_trigger
+        else configured_stop_on_trigger
+    )
+
+    # -------------------------------------------------------------------------
+    # 3. Resolve and validate confidence representation reader
+    # -------------------------------------------------------------------------
 
     reader_path = get_project_path(
         config,
@@ -551,33 +687,66 @@ def main():
         )
     )
 
-    # ------------------------------------------------------------------
-    # 5. Load Adaptive-RAG complexity evaluator.
-    # ------------------------------------------------------------------
-
     print(
-        "Loading query-complexity evaluator..."
+        "Confidence representation reader loaded."
     )
 
     print(
-        f"  {args.complexity_model}"
+        f"  {reader_path}"
     )
 
-    complexity_evaluator = (
-        AdaptiveRAGComplexityEvaluator(
-            model_name=args.complexity_model
+    # -------------------------------------------------------------------------
+    # 4. Load external query-complexity evaluator
+    # -------------------------------------------------------------------------
+    #
+    # Query complexity is question-level and needs to be computed only once.
+    # It is therefore calculated before live token generation.
+    # -------------------------------------------------------------------------
+
+    complexity_config = config.get(
+        "complexity",
+        {},
+    )
+
+    print(
+        "\nLoading query-complexity evaluator..."
+    )
+
+    print(
+        "  Base model: "
+        f"{complexity_config.get('base_model_name', 't5-large')}"
+    )
+
+    print(
+        "  4-bit: "
+        f"{complexity_config.get('load_in_4bit', True)}"
+    )
+
+    complexity_evaluator, resolved_adapter = (
+        build_complexity_evaluator(
+            config=config,
+            adapter_path=args.complexity_adapter,
         )
     )
 
-    # ------------------------------------------------------------------
-    # 6. Compute query complexity explicitly once.
+    print(
+        f"  Adapter: {resolved_adapter}"
+    )
+
+    print(
+        "Query-complexity evaluator loaded."
+    )
+
+    # -------------------------------------------------------------------------
+    # 5. Compute query complexity exactly once
+    # -------------------------------------------------------------------------
     #
-    # We evaluate it here so that:
+    # We compute E before generation so:
     #
-    #     - the A/B/C probabilities can be displayed,
-    #     - E can be printed,
-    #     - and the same exact E is then reused during generation.
-    # ------------------------------------------------------------------
+    #     - A/B/C probabilities can be displayed,
+    #     - E can be displayed,
+    #     - and the exact same E is reused for every generated token.
+    # -------------------------------------------------------------------------
 
     complexity = (
         complexity_evaluator.evaluate(
@@ -590,22 +759,48 @@ def main():
         complexity=complexity,
     )
 
-    # ------------------------------------------------------------------
-    # 7. Complexity callable used by generation.py.
-    #
-    # Since complexity has already been evaluated, return the cached result.
-    #
-    # This avoids running T5 twice for the same question.
-    # ------------------------------------------------------------------
+    # -------------------------------------------------------------------------
+    # 6. Cache complexity for generation.py
+    # -------------------------------------------------------------------------
 
     def complexity_fn(
         _question: str,
+        cached_complexity=complexity,
     ):
-        return complexity
+        """
+        Return the already-computed query complexity.
 
-    # ------------------------------------------------------------------
-    # 8. Run live token-by-token generation and confidence detection.
-    # ------------------------------------------------------------------
+        External complexity E is question-level, so it must not be recomputed
+        independently for every generated token.
+        """
+
+        return cached_complexity
+
+    # -------------------------------------------------------------------------
+    # 7. Load Mistral model/tokenizer
+    # -------------------------------------------------------------------------
+
+    print(
+        "\nLoading base language model..."
+    )
+
+    tokenizer, model = (
+        load_configured_model(
+            config
+        )
+    )
+
+    print(
+        "Base language model loaded."
+    )
+
+    # -------------------------------------------------------------------------
+    # 8. Run live IE-KRT generation
+    # -------------------------------------------------------------------------
+
+    print(
+        "\nStarting live IE-KRT generation..."
+    )
 
     result = (
         answer_with_confidence(
@@ -624,18 +819,34 @@ def main():
         )
     )
 
-    # ------------------------------------------------------------------
-    # 9. Token-level display.
-    # ------------------------------------------------------------------
+    # -------------------------------------------------------------------------
+    # 9. Attach external complexity explicitly to result
+    # -------------------------------------------------------------------------
+
+    result[
+        "complexity"
+    ] = complexity_to_dict(
+        complexity
+    )
+
+    result[
+        "E"
+    ] = float(
+        complexity.E
+    )
+
+    # -------------------------------------------------------------------------
+    # 10. Token-level display
+    # -------------------------------------------------------------------------
 
     print_token_results(
         result=result,
         threshold=trigger_threshold,
     )
 
-    # ------------------------------------------------------------------
-    # 10. Final decision.
-    # ------------------------------------------------------------------
+    # -------------------------------------------------------------------------
+    # 11. Final decision
+    # -------------------------------------------------------------------------
 
     retrieval_triggered = bool(
         result.get(
@@ -697,9 +908,9 @@ def main():
             f"{trigger_index}"
         )
 
-    # ------------------------------------------------------------------
-    # 11. Optional JSON output.
-    # ------------------------------------------------------------------
+    # -------------------------------------------------------------------------
+    # 12. Optional JSON output
+    # -------------------------------------------------------------------------
 
     if args.output is not None:
 
@@ -713,11 +924,14 @@ def main():
         )
 
         output = {
+
             "question":
                 args.question,
 
             "complexity":
-                complexity.to_dict(),
+                complexity_to_dict(
+                    complexity
+                ),
 
             "trigger_threshold":
                 trigger_threshold,
@@ -751,9 +965,9 @@ def main():
         )
 
 
-# ==========================================================================
+# =============================================================================
 # Entry point
-# ==========================================================================
+# =============================================================================
 
 if __name__ == "__main__":
     main()
