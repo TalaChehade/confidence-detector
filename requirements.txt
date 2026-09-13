@@ -1,27 +1,30 @@
 # =============================================================================
-# INKER IE-KRT Replication - Python Dependencies
+# INKER IE-KRT Replication
 # =============================================================================
 
 # Deep learning
 torch
 
-# Hugging Face model loading and inference
+# Hugging Face
 transformers
 accelerate
 huggingface_hub
+sentencepiece
+safetensors
 
-# 4-bit Mistral loading
+# Quantized model loading
 bitsandbytes
 
-# PCA and evaluation metrics
+# LoRA / PEFT
+peft
+
+# PCA and evaluation
 scikit-learn
 
-# Numerical and tabular processing
+# Data processing
 numpy
 pandas
 
-# Progress bars
+# Utilities
 tqdm
-
-# YAML configuration
 PyYAML
