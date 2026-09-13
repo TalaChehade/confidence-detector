@@ -1,17 +1,18 @@
+```yaml
 # =============================================================================
 # INKER Confidence Detector / IE-KRT Replication Configuration
 # =============================================================================
 #
-# This file is the central configuration for:
+# Central configuration for:
 #
 #   - confidence-detector training,
 #   - confidence-detector evaluation,
 #   - confidence-only generation,
-#   - Adaptive-RAG complexity evaluation,
+#   - Adaptive-RAG query-complexity evaluation,
 #   - and the live INKER IE-KRT retrieval trigger.
 #
-# Keep training and evaluation settings synchronized through this file rather
-# than hard-coding values independently inside experiment scripts.
+# Training and evaluation settings should remain synchronized through this
+# file rather than being hard-coded independently inside experiment scripts.
 # =============================================================================
 
 
@@ -56,13 +57,14 @@ paths:
 
 model:
 
-  # Base LLM used by the INKER confidence detector replication.
+  # Base LLM used by the INKER internal-confidence detector.
   name: "mistralai/Mistral-7B-Instruct-v0.1"
 
-  # Load Mistral with BitsAndBytes 4-bit quantization.
+  # Load Mistral using BitsAndBytes 4-bit quantization.
   load_in_4bit: true
 
-  # FP16 is retained for consistency with the existing replication setup.
+  # FP16 is retained for consistency with the existing confidence-detector
+  # replication experiments.
   compute_dtype: "float16"
 
   # Nested / double quantization.
@@ -71,8 +73,8 @@ model:
   # BitsAndBytes 4-bit quantization type.
   quant_type: "nf4"
 
-  # Required when rep_token = -1 so the last tensor position corresponds to
-  # the final real token for every sequence in a padded batch.
+  # Required when rep_token = -1 so the last tensor position corresponds
+  # to the final real token for every sequence in a padded batch.
   padding_side: "left"
 
   # Mistral replication setting used by the existing implementation.
@@ -88,9 +90,10 @@ model:
 
 detector:
 
-  # INKER Appendix-B-style detector layers.
+  # INKER Appendix-B-style confidence-detector layers.
   #
   # Inclusive range:
+  #
   #   10, 11, ..., 25
   #
   # Total = 16 hidden layers.
@@ -115,13 +118,17 @@ detector:
   # Hidden representation position.
   #
   # With left padding:
-  #   -1 = last real token.
+  #
+  #   -1 = last real token
+  #
   rep_token: -1
 
   # One confident-vs-unconfident difference vector per pair.
   #
   # The current replication requires:
+  #
   #   n_difference = 1
+  #
   n_difference: 1
 
   # Hidden-state extraction batch size.
@@ -135,7 +142,11 @@ detector:
 # Train / evaluation split
 # =============================================================================
 #
-# train_detector.py and evaluate_detector.py MUST use the same ratios and seed.
+# train_detector.py and evaluate_detector.py MUST use the same:
+#
+#   - split ratios
+#   - random seed
+#
 # =============================================================================
 
 split:
@@ -149,40 +160,83 @@ split:
 # External query-complexity evaluator
 # =============================================================================
 #
-# Primary replication uses the pretrained third-party Adaptive-RAG
-# reproduction rather than retraining T5-Large from scratch.
+# The current proof-of-concept complexity evaluator uses:
 #
-# The original INKER implementation details are not sufficient to reproduce
-# an exact continuous conversion from A/B/C into E, so the mapping below is
-# explicitly treated as a replication assumption.
+#   T5-Large
+#       +
+#   4-bit NF4 loading
+#       +
+#   locally trained Adaptive-RAG LoRA adapter
+#
+# The LoRA adapter was trained using the prepared Adaptive-RAG classifier
+# data and predicts:
+#
+#   A = no retrieval
+#   B = single-step retrieval
+#   C = multi-step retrieval
+#
+# The original INKER implementation does not expose an exact calibration
+# from Adaptive-RAG A/B/C probabilities into continuous E.
+#
+# Therefore the mapping below is explicitly treated as a replication
+# assumption.
 # =============================================================================
 
 complexity:
 
-  # Pretrained Adaptive-RAG-style T5-Large reproduction.
-  model_name: "LenckCuak/Adaptive-RAG"
+  # Public frozen base model.
+  #
+  # The LoRA adapter does NOT contain the complete T5-Large weights.
+  # T5-Large is loaded separately at runtime.
+  base_model_name: "t5-large"
 
-  # Input-length limit used by the T5 evaluator.
+  # Trained Adaptive-RAG LoRA adapter.
+  #
+  # This may point directly to:
+  #
+  #   - the ZIP stored in Google Drive, or
+  #   - an already extracted adapter directory.
+  #
+  # inker.complexity automatically extracts the ZIP into local Colab
+  # storage when necessary.
+  adapter_path: "/content/drive/MyDrive/INKER_Models/adaptive_rag_t5_large_lora.zip"
+
+  # Maximum query length used by the T5 complexity evaluator.
   max_input_length: 384
 
-  # Replication assumption:
+  # Load the frozen T5-Large base model using BitsAndBytes 4-bit
+  # quantization for lower GPU-memory usage.
+  load_in_4bit: true
+
+  # Automatically use BF16 when supported by the GPU.
   #
-  #   A = no retrieval        -> 0.0
-  #   B = single retrieval    -> 0.5
-  #   C = multi-step retrieval -> 1.0
+  # Otherwise the complexity loader selects its configured fallback.
+  compute_dtype: "auto"
+
+  # -------------------------------------------------------------------------
+  # Continuous-complexity replication assumption
+  # -------------------------------------------------------------------------
+  #
+  # Adaptive-RAG classes:
+  #
+  #   A = no retrieval         -> 0.0
+  #   B = single-step retrieval -> 0.5
+  #   C = multi-step retrieval  -> 1.0
   #
   label_values:
     A: 0.0
     B: 0.5
     C: 1.0
 
-  # Continuous external complexity:
+  # Continuous external query complexity:
   #
   #   E = 0.0 * P(A)
   #       + 0.5 * P(B)
   #       + 1.0 * P(C)
   #
-  #     = 0.5 * P(B) + P(C)
+  # which simplifies to:
+  #
+  #   E = 0.5 * P(B) + P(C)
   #
   score_method: "probability_weighted_ordinal"
 
@@ -193,11 +247,11 @@ complexity:
 
 generation:
 
-  # Maximum number of tokens generated for experiments that do not stop
-  # earlier because of an IE-KRT retrieval trigger.
+  # Maximum number of generated tokens for experiments that do not stop
+  # earlier because an IE-KRT retrieval trigger fires.
   max_new_tokens: 60
 
-  # Repetition penalty used during generation.
+  # Repetition penalty used during autoregressive generation.
   repetition_penalty: 1.1
 
 
@@ -205,11 +259,12 @@ generation:
 # Confidence-only baseline
 # =============================================================================
 #
-# A content token is considered low-confidence when:
+# A content token is considered low confidence when:
 #
 #   m_tilde_i < confidence.threshold
 #
-# This threshold is conceptually independent from the INKER K threshold.
+# This threshold is conceptually independent from the IE-KRT retrieval
+# threshold.
 # =============================================================================
 
 confidence:
@@ -225,18 +280,26 @@ confidence:
 #
 #   K(t_i) = (E - m_tilde_i) * s_i
 #
+# where:
+#
+#   E         = external query complexity
+#   m_tilde_i = normalized internal confidence
+#   s_i       = content-token mask
+#
 # Retrieval is triggered when:
 #
 #   K(t_i) > trigger.threshold
+#
 # =============================================================================
 
 trigger:
 
   threshold: 0.5
 
-  # In live IE-KRT testing, stop immediately when the first trigger occurs.
+  # Stop generation immediately when the first retrieval trigger occurs.
   #
-  # This lets us identify the exact point at which retrieval would be invoked.
+  # This makes it possible to identify the exact token at which external
+  # retrieval would be invoked.
   stop_on_trigger: true
 
 
@@ -255,3 +318,4 @@ experiment:
   #   - dataset splitting
   #
   seed: 0
+```
