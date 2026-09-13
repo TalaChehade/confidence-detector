@@ -122,6 +122,8 @@ from typing import Any, Callable, Dict, List, Optional, Sequence
 import numpy as np
 import torch
 
+from .trigger import evaluate_token_activation
+
 
 # ==========================================================================
 # Stop words
@@ -1071,17 +1073,20 @@ def _live_generate(
 
         else:
 
+            activation = evaluate_token_activation(
+                token=token,
+                E=E,
+                m_tilde=m_tilde,
+                content_mask=s_i,
+                threshold=trigger_threshold,
+            )
+
             K = float(
-                (
-                    E
-                    - m_tilde
-                )
-                * s_i
+                activation.activation
             )
 
             triggered = bool(
-                s_i == 1
-                and K > trigger_threshold
+                activation.triggered
             )
 
         entry = {
@@ -1098,6 +1103,11 @@ def _live_generate(
                 next_token_id,
 
             "raw_score":
+                float(
+                    raw_score
+                ),
+
+            "raw_confidence":
                 float(
                     raw_score
                 ),
@@ -1244,15 +1254,36 @@ def _live_generate(
         "retrieval_triggered":
             first_trigger is not None,
 
+        # Compatibility aliases used by experiment scripts.
+        "triggered":
+            first_trigger is not None,
+
+        "would_trigger_full":
+            first_trigger is not None,
+
         "stopped_for_retrieval":
             bool(
                 first_trigger is not None
                 and stop_on_trigger
             ),
 
-        "trigger_token":
+        "trigger_entry":
             (
                 first_trigger
+                if first_trigger is not None
+                else None
+            ),
+
+        "trigger_token":
+            (
+                first_trigger.get("token")
+                if first_trigger is not None
+                else None
+            ),
+
+        "trigger_index":
+            (
+                int(first_trigger.get("token_index"))
                 if first_trigger is not None
                 else None
             ),
@@ -1343,7 +1374,7 @@ def answer_with_confidence(
     rep_reader: Dict[str, Any],
     layers: Sequence[int],
     complexity_fn: Callable[[str], Any],
-    threshold: float = 0.5,
+    trigger_threshold: float = 0.5,
     confidence_threshold: float = 0.5,
     max_new_tokens: int = 60,
     repetition_penalty: float = 1.1,
@@ -1379,7 +1410,7 @@ def answer_with_confidence(
 
     Parameters
     ----------
-    threshold:
+    trigger_threshold:
         Retrieval activation threshold tau.
 
     confidence_threshold:
@@ -1423,7 +1454,7 @@ def answer_with_confidence(
         )
 
         print(
-            f"Retrieval threshold tau: {threshold:.4f}"
+            f"Retrieval threshold tau: {trigger_threshold:.4f}"
         )
 
         print(
@@ -1437,7 +1468,7 @@ def answer_with_confidence(
         rep_reader=rep_reader,
         layers=layers,
         E=E,
-        trigger_threshold=threshold,
+        trigger_threshold=trigger_threshold,
         confidence_threshold=confidence_threshold,
         max_new_tokens=max_new_tokens,
         repetition_penalty=repetition_penalty,
@@ -1482,7 +1513,7 @@ def answer_with_confidence(
         ]:
 
             trigger = result[
-                "trigger_token"
+                "trigger_entry"
             ]
 
             print(
@@ -1538,7 +1569,7 @@ def answer_with_confidence_only(
     rep_reader: Dict[str, Any],
     layers: Sequence[int],
     expected_answer: Optional[str] = None,
-    threshold: float = 0.5,
+    confidence_threshold: float = 0.5,
     max_new_tokens: int = 60,
     repetition_penalty: float = 1.1,
     verbose: bool = False,
@@ -1555,10 +1586,10 @@ def answer_with_confidence_only(
     Content tokens are classified as:
 
         CONFIDENT
-            m_tilde_i >= threshold
+            m_tilde_i >= confidence_threshold
 
         UNCONFIDENT
-            m_tilde_i < threshold
+            m_tilde_i < confidence_threshold
 
     Stop words and punctuation still contribute to the causal confidence
     history but receive s_i=0 and status ``MASKED``.
@@ -1576,7 +1607,7 @@ def answer_with_confidence_only(
         layers=layers,
         E=None,
         trigger_threshold=0.5,
-        confidence_threshold=threshold,
+        confidence_threshold=confidence_threshold,
         max_new_tokens=max_new_tokens,
         repetition_penalty=repetition_penalty,
         system_message=system_message,
@@ -1589,8 +1620,13 @@ def answer_with_confidence_only(
     ] = expected_answer
 
     result[
+        "confidence_threshold"
+    ] = confidence_threshold
+
+    # Backward-compatible alias.
+    result[
         "threshold"
-    ] = threshold
+    ] = confidence_threshold
 
     # Compatibility with the previous confidence-only interface.
     result[
