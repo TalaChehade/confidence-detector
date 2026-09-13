@@ -218,10 +218,10 @@ class AdaptiveRAGComplexityEvaluator:
         load_in_4bit: bool = True,
         compute_dtype: str = "auto",
     ):
-        if not torch.cuda.is_available():
+        if load_in_4bit and not torch.cuda.is_available():
             raise RuntimeError(
-                "The current complexity evaluator is configured "
-                "for BitsAndBytes 4-bit inference and requires CUDA."
+                "4-bit BitsAndBytes complexity inference requires CUDA. "
+                "Either run on a GPU runtime or set complexity.load_in_4bit=false."
             )
 
         self.base_model_name = base_model_name
@@ -305,9 +305,14 @@ class AdaptiveRAGComplexityEvaluator:
 
     @property
     def device(self):
-        return next(
-            self.model.parameters()
-        ).device
+        """Return the device that should receive tokenizer inputs."""
+
+        try:
+            return self.model.get_input_embeddings().weight.device
+        except Exception:
+            return next(
+                self.model.parameters()
+            ).device
 
     @torch.no_grad()
     def _class_log_scores(
