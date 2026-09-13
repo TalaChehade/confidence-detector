@@ -16,10 +16,18 @@ behaviors, including:
 For each question, the experiment combines:
 
     1. External query complexity E
-       estimated using the Adaptive-RAG-style T5-Large evaluator.
+       ---------------------------
+       Estimated using:
+
+           T5-Large
+               +
+           4-bit NF4 loading
+               +
+           locally trained Adaptive-RAG LoRA adapter
 
     2. Internal token confidence m_tilde_i
-       estimated from the trained confidence representation reader.
+       -----------------------------------
+       Estimated from the trained Mistral confidence representation reader.
 
     3. Token-content mask s_i.
 
@@ -51,14 +59,43 @@ This script implements IE-KRT:
 
 It does NOT yet perform retrieval after a trigger.
 
-The full IE-KQF / retrieval / evidence-injection pipeline will be implemented
+The full IE-KQF / retrieval / evidence-injection pipeline is implemented
 separately.
+
+External complexity
+-------------------
+The Adaptive-RAG classifier predicts:
+
+    A = no retrieval
+    B = single-step retrieval
+    C = multi-step retrieval
+
+For the INKER replication, the probabilities are converted into a continuous
+query-complexity score using:
+
+    E = 0.0 * P(A)
+        + 0.5 * P(B)
+        + 1.0 * P(C)
+
+which simplifies to:
+
+    E = 0.5 * P(B) + P(C)
+
+The mapping:
+
+    A -> 0.0
+    B -> 0.5
+    C -> 1.0
+
+is a replication assumption and should not be presented as an exact
+calibration formula released by the INKER authors.
 """
 
 from __future__ import annotations
 
 import argparse
 import pickle
+import random
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Sequence
 
@@ -75,7 +112,6 @@ from _common import (
 
 from inker.complexity import (
     AdaptiveRAGComplexityEvaluator,
-    DEFAULT_ADAPTIVE_RAG_MODEL,
 )
 
 from inker.generation import (
@@ -88,144 +124,134 @@ from inker.generation import (
 # ==========================================================================
 
 TEST_SUITE = [
+
+    # ----------------------------------------------------------------------
+    # Paper-inspired cases
+    # ----------------------------------------------------------------------
+
     {
-        "question":
+        "question": (
             "In what city is the company that Fastjet Tanzania "
             "was originally founded as a part of prior to "
-            "rebranding based?",
-
-        "category":
-            "paper_case_study",
-
-        "expected_answer":
-            "Nairobi",
+            "rebranding based?"
+        ),
+        "category": "paper_case_study",
+        "expected_answer": "Nairobi",
     },
+
     {
-        "question":
+        "question": (
             "Stephen Smith appears on ESPN First Take alongside "
-            "which HBO boxing commentator?",
-
-        "category":
-            "paper_case_study",
-
-        "expected_answer":
-            "Kellerman",
+            "which HBO boxing commentator?"
+        ),
+        "category": "paper_case_study",
+        "expected_answer": "Kellerman",
     },
+
+    # ----------------------------------------------------------------------
+    # High-confidence correct cases
+    # ----------------------------------------------------------------------
+
     {
-        "question":
-            "What is the capital of France?",
-
-        "category":
-            "high_conf_correct",
-
-        "expected_answer":
-            "Paris",
+        "question": "What is the capital of France?",
+        "category": "high_conf_correct",
+        "expected_answer": "Paris",
     },
+
     {
-        "question":
-            "What is the chemical symbol for water?",
-
-        "category":
-            "high_conf_correct",
-
-        "expected_answer":
-            "H2O",
+        "question": "What is the chemical symbol for water?",
+        "category": "high_conf_correct",
+        "expected_answer": "H2O",
     },
+
+    # ----------------------------------------------------------------------
+    # Potentially overconfident / misleading cases
+    # ----------------------------------------------------------------------
+
     {
-        "question":
+        "question": (
             "Who played the villain in the original 1984 "
-            "Terminator movie?",
-
-        "category":
-            "high_conf_wrong_target",
-
-        "expected_answer":
-            None,
+            "Terminator movie?"
+        ),
+        "category": "high_conf_wrong_target",
+        "expected_answer": None,
     },
+
     {
-        "question":
+        "question": (
             "Which HBO boxing analyst co-hosted ESPN's "
-            "First Take with Stephen A. Smith?",
-
-        "category":
-            "high_conf_wrong_target",
-
-        "expected_answer":
-            "Kellerman",
+            "First Take with Stephen A. Smith?"
+        ),
+        "category": "high_conf_wrong_target",
+        "expected_answer": "Kellerman",
     },
+
     {
-        "question":
-            "How many senses do humans have?",
-
-        "category":
-            "high_conf_wrong_target",
-
-        "expected_answer":
-            None,
+        "question": "How many senses do humans have?",
+        "category": "high_conf_wrong_target",
+        "expected_answer": None,
     },
+
     {
-        "question":
+        "question": (
             "Does the oldest section of the Great Wall of China "
-            "predate the Qin dynasty?",
-
-        "category":
-            "high_conf_wrong_target",
-
-        "expected_answer":
-            None,
+            "predate the Qin dynasty?"
+        ),
+        "category": "high_conf_wrong_target",
+        "expected_answer": None,
     },
+
+    # ----------------------------------------------------------------------
+    # Numeric / specification cases
+    # ----------------------------------------------------------------------
+
     {
-        "question":
-            "What are the dimensions of the Xiaomi SU7?",
-
-        "category":
-            "numeric_spec",
-
-        "expected_answer":
-            None,
+        "question": "What are the dimensions of the Xiaomi SU7?",
+        "category": "numeric_spec",
+        "expected_answer": None,
     },
+
     {
-        "question":
-            "What is the population of Lebanon as of 2024?",
-
-        "category":
-            "numeric_spec",
-
-        "expected_answer":
-            None,
+        "question": "What is the population of Lebanon as of 2024?",
+        "category": "numeric_spec",
+        "expected_answer": None,
     },
+
+    # ----------------------------------------------------------------------
+    # Ambiguous / recency-sensitive cases
+    # ----------------------------------------------------------------------
+
     {
-        "question":
-            "Who is the last president of the United States?",
-
-        "category":
-            "ambiguous_recency",
-
-        "expected_answer":
-            None,
+        "question": "Who is the last president of the United States?",
+        "category": "ambiguous_recency",
+        "expected_answer": None,
     },
+
+    # ----------------------------------------------------------------------
+    # Expected low-confidence / fictional cases
+    # ----------------------------------------------------------------------
+
     {
-        "question":
+        "question": (
             "What is the capital of the fictional country "
-            "Gorgonzolia?",
-
-        "category":
-            "low_conf_expected",
-
-        "expected_answer":
-            None,
+            "Gorgonzolia?"
+        ),
+        "category": "low_conf_expected",
+        "expected_answer": None,
     },
+
+    # ----------------------------------------------------------------------
+    # Multihop case
+    # ----------------------------------------------------------------------
+
     {
-        "question":
+        "question": (
             "What year did Guns N' Roses perform a promo for "
             "a movie starring Arnold Schwarzenegger as a former "
-            "New York Police detective?",
-
-        "category":
-            "multihop",
-
-        "expected_answer":
-            "1999",
+            "New York Police detective?"
+        ),
+        "category": "multihop",
+        "expected_answer": "1999",
     },
 ]
 
@@ -234,26 +260,17 @@ TEST_SUITE = [
 # Reproducibility
 # ==========================================================================
 
-def set_random_seed(
-    seed: int,
-) -> None:
+def set_random_seed(seed: int) -> None:
     """
-    Seed Python-adjacent numerical libraries used by this experiment.
+    Seed Python, NumPy, and PyTorch.
     """
 
-    np.random.seed(
-        seed
-    )
-
-    torch.manual_seed(
-        seed
-    )
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
 
     if torch.cuda.is_available():
-
-        torch.cuda.manual_seed_all(
-            seed
-        )
+        torch.cuda.manual_seed_all(seed)
 
 
 # ==========================================================================
@@ -269,26 +286,16 @@ def load_representation_reader(
     """
 
     if not reader_path.exists():
-
         raise FileNotFoundError(
             "Representation reader not found:\n"
             f"    {reader_path}\n\n"
             "Run experiments/train_detector.py first."
         )
 
-    with reader_path.open(
-        "rb"
-    ) as file:
+    with reader_path.open("rb") as file:
+        rep_reader = pickle.load(file)
 
-        rep_reader = pickle.load(
-            file
-        )
-
-    if not isinstance(
-        rep_reader,
-        dict,
-    ):
-
+    if not isinstance(rep_reader, dict):
         raise TypeError(
             "Representation reader must be a dictionary."
         )
@@ -299,15 +306,11 @@ def load_representation_reader(
         "signs",
     }
 
-    missing = (
-        required_components
-        - set(
-            rep_reader.keys()
-        )
+    missing = required_components - set(
+        rep_reader.keys()
     )
 
     if missing:
-
         raise KeyError(
             "Representation reader is missing required components: "
             f"{sorted(missing)}"
@@ -317,13 +320,13 @@ def load_representation_reader(
 
         for component in required_components:
 
-            if layer not in rep_reader[
-                component
-            ]:
+            if layer not in rep_reader[component]:
 
                 raise KeyError(
                     f"Representation reader does not contain "
-                    f"layer {layer} in '{component}'."
+                    f"layer {layer} in '{component}'.\n"
+                    "Training and live evaluation must use the "
+                    "same detector layers."
                 )
 
     return rep_reader
@@ -340,24 +343,18 @@ def safe_mean(
     Return the mean of valid values, or NaN if none exist.
     """
 
-    values = [
+    valid_values = [
         float(value)
         for value in values
         if value is not None
-        and np.isfinite(
-            float(value)
-        )
+        and np.isfinite(float(value))
     ]
 
-    if not values:
-        return float(
-            "nan"
-        )
+    if not valid_values:
+        return float("nan")
 
     return float(
-        np.mean(
-            values
-        )
+        np.mean(valid_values)
     )
 
 
@@ -368,24 +365,18 @@ def safe_min(
     Return the minimum of valid values, or NaN if none exist.
     """
 
-    values = [
+    valid_values = [
         float(value)
         for value in values
         if value is not None
-        and np.isfinite(
-            float(value)
-        )
+        and np.isfinite(float(value))
     ]
 
-    if not values:
-        return float(
-            "nan"
-        )
+    if not valid_values:
+        return float("nan")
 
     return float(
-        np.min(
-            values
-        )
+        np.min(valid_values)
     )
 
 
@@ -396,24 +387,18 @@ def safe_max(
     Return the maximum of valid values, or NaN if none exist.
     """
 
-    values = [
+    valid_values = [
         float(value)
         for value in values
         if value is not None
-        and np.isfinite(
-            float(value)
-        )
+        and np.isfinite(float(value))
     ]
 
-    if not values:
-        return float(
-            "nan"
-        )
+    if not valid_values:
+        return float("nan")
 
     return float(
-        np.max(
-            values
-        )
+        np.max(valid_values)
     )
 
 
@@ -432,7 +417,8 @@ def simple_expected_answer_match(
     ---------
     This is only a convenience diagnostic.
 
-    It is NOT a robust semantic correctness metric.
+    It is NOT a robust semantic correctness metric and must not be
+    reported as benchmark accuracy.
 
     Examples
     --------
@@ -441,7 +427,7 @@ def simple_expected_answer_match(
 
         -> True
 
-    But the same substring-based method may fail on:
+    The method may fail for:
 
         - synonyms,
         - paraphrases,
@@ -449,8 +435,6 @@ def simple_expected_answer_match(
         - numeric formatting,
         - partially correct answers,
         - or answers containing the expected string in an incorrect context.
-
-    Therefore this field should not be reported as benchmark accuracy.
     """
 
     if expected_answer is None:
@@ -480,16 +464,16 @@ def simple_expected_answer_match(
 
 def main(
     config_path: str | Path | None = None,
-    complexity_model: str = DEFAULT_ADAPTIVE_RAG_MODEL,
+    complexity_adapter: str | None = None,
     num_tests: int | None = None,
 ) -> None:
     """
     Run the qualitative live IE-KRT test suite.
     """
 
-    # ------------------------------------------------------------------
-    # 1. Configuration.
-    # ------------------------------------------------------------------
+    # ----------------------------------------------------------------------
+    # 1. Configuration
+    # ----------------------------------------------------------------------
 
     config = get_config(
         config_path
@@ -511,9 +495,9 @@ def main(
         config
     )
 
-    # ------------------------------------------------------------------
-    # 2. Paths.
-    # ------------------------------------------------------------------
+    # ----------------------------------------------------------------------
+    # 2. Paths
+    # ----------------------------------------------------------------------
 
     reader_path = get_project_path(
         config,
@@ -530,25 +514,26 @@ def main(
         exist_ok=True,
     )
 
-    # ------------------------------------------------------------------
-    # 3. Thresholds.
+    # ----------------------------------------------------------------------
+    # 3. Threshold and generation configuration
     #
-    # Confidence-only and full retrieval thresholds are separate.
-    # ------------------------------------------------------------------
+    # Confidence-only and full retrieval thresholds are intentionally
+    # separate concepts.
+    # ----------------------------------------------------------------------
 
     confidence_config = config.get(
         "confidence",
-        {}
+        {},
     )
 
     trigger_config = config.get(
         "trigger",
-        {}
+        {},
     )
 
     generation_config = config.get(
         "generation",
-        {}
+        {},
     )
 
     confidence_threshold = float(
@@ -586,55 +571,9 @@ def main(
         )
     )
 
-    # ------------------------------------------------------------------
-    # 4. Load trained internal confidence detector.
-    # ------------------------------------------------------------------
-
-    rep_reader = (
-        load_representation_reader(
-            reader_path=reader_path,
-            layers=layers,
-        )
-    )
-
-    # ------------------------------------------------------------------
-    # 5. Load base LLM.
-    # ------------------------------------------------------------------
-
-    print(
-        "Loading base language model..."
-    )
-
-    tokenizer, model = (
-        load_configured_model(
-            config
-        )
-    )
-
-    # ------------------------------------------------------------------
-    # 6. Load Adaptive-RAG-style complexity evaluator.
-    #
-    # No locally trained Eva checkpoint is required for the primary
-    # replication.
-    # ------------------------------------------------------------------
-
-    print(
-        "Loading query-complexity evaluator..."
-    )
-
-    print(
-        f"  {complexity_model}"
-    )
-
-    complexity_evaluator = (
-        AdaptiveRAGComplexityEvaluator(
-            model_name=complexity_model
-        )
-    )
-
-    # ------------------------------------------------------------------
-    # 7. Select tests.
-    # ------------------------------------------------------------------
+    # ----------------------------------------------------------------------
+    # 4. Select tests BEFORE loading large models
+    # ----------------------------------------------------------------------
 
     test_cases = list(
         TEST_SUITE
@@ -643,7 +582,6 @@ def main(
     if num_tests is not None:
 
         if num_tests <= 0:
-
             raise ValueError(
                 "--num-tests must be greater than zero."
             )
@@ -652,13 +590,120 @@ def main(
             :num_tests
         ]
 
+    if not test_cases:
+        raise ValueError(
+            "No test cases selected."
+        )
+
     print(
-        f"\nRunning {len(test_cases)} qualitative tests..."
+        f"\nTests selected: "
+        f"{len(test_cases)}"
     )
 
-    # ------------------------------------------------------------------
-    # 8. Run.
-    # ------------------------------------------------------------------
+    # ----------------------------------------------------------------------
+    # 5. Load trained internal confidence detector
+    # ----------------------------------------------------------------------
+
+    print(
+        "\nLoading confidence representation reader..."
+    )
+
+    rep_reader = (
+        load_representation_reader(
+            reader_path=reader_path,
+            layers=layers,
+        )
+    )
+
+    print(
+        "✓ Confidence representation reader loaded."
+    )
+
+    # ----------------------------------------------------------------------
+    # 6. Load base Mistral LLM
+    # ----------------------------------------------------------------------
+
+    print(
+        "\nLoading base language model..."
+    )
+
+    tokenizer, model = (
+        load_configured_model(
+            config
+        )
+    )
+
+    print(
+        "✓ Base language model loaded."
+    )
+
+    # ----------------------------------------------------------------------
+    # 7. Load T5-Large + 4-bit + LoRA complexity evaluator
+    # ----------------------------------------------------------------------
+
+    complexity_config = config.get(
+        "complexity",
+        {},
+    )
+
+    configured_adapter = (
+        complexity_config.get(
+            "adapter_path"
+        )
+    )
+
+    resolved_adapter = (
+        complexity_adapter
+        if complexity_adapter is not None
+        else configured_adapter
+    )
+
+    if not resolved_adapter:
+        raise ValueError(
+            "No Adaptive-RAG LoRA adapter configured.\n\n"
+            "Set:\n"
+            "  complexity.adapter_path\n\n"
+            "in configs/default.yaml or pass:\n"
+            "  --complexity-adapter PATH"
+        )
+
+    print(
+        "\nLoading query-complexity evaluator..."
+    )
+
+    print(
+        f"  Base model: "
+        f"{complexity_config.get('base_model_name', 't5-large')}"
+    )
+
+    print(
+        f"  Adapter: {resolved_adapter}"
+    )
+
+    print(
+        f"  4-bit: "
+        f"{complexity_config.get('load_in_4bit', True)}"
+    )
+
+    complexity_evaluator = (
+        AdaptiveRAGComplexityEvaluator.from_config(
+            config=config,
+            adapter_path=resolved_adapter,
+        )
+    )
+
+    print(
+        "✓ Query-complexity evaluator loaded."
+    )
+
+    # ----------------------------------------------------------------------
+    # 8. Run test suite
+    # ----------------------------------------------------------------------
+
+    print(
+        f"\nRunning "
+        f"{len(test_cases)} qualitative tests..."
+    )
 
     question_rows: List[
         Dict[str, Any]
@@ -696,12 +741,12 @@ def main(
             f"Question: {question}"
         )
 
-        # --------------------------------------------------------------
-        # Evaluate query complexity once.
+        # ------------------------------------------------------------------
+        # External query complexity
         #
-        # We cache this result so generation.py does not need to run the
-        # T5 evaluator a second time.
-        # --------------------------------------------------------------
+        # This is a question-level value, so evaluate T5 only ONCE for
+        # each question.
+        # ------------------------------------------------------------------
 
         complexity = (
             complexity_evaluator.evaluate(
@@ -709,15 +754,47 @@ def main(
             )
         )
 
+        print(
+            f"  Complexity class = "
+            f"{complexity.predicted_class}"
+        )
+
+        print(
+            f"  P(A) = "
+            f"{complexity.p_A:.4f}"
+        )
+
+        print(
+            f"  P(B) = "
+            f"{complexity.p_B:.4f}"
+        )
+
+        print(
+            f"  P(C) = "
+            f"{complexity.p_C:.4f}"
+        )
+
+        print(
+            f"  E = "
+            f"{complexity.E:.4f}"
+        )
+
+        # ------------------------------------------------------------------
+        # Cache complexity result.
+        #
+        # generation.py expects a complexity callable, but the result must
+        # remain constant during generation for this question.
+        # ------------------------------------------------------------------
+
         def complexity_fn(
             _question: str,
             cached_complexity=complexity,
         ):
             return cached_complexity
 
-        # --------------------------------------------------------------
-        # Live IE-KRT generation.
-        # --------------------------------------------------------------
+        # ------------------------------------------------------------------
+        # Live IE-KRT generation
+        # ------------------------------------------------------------------
 
         record = (
             answer_with_confidence(
@@ -736,10 +813,23 @@ def main(
             )
         )
 
-        # --------------------------------------------------------------
-        # Support either token-history naming while repository cleanup is
-        # still in progress.
-        # --------------------------------------------------------------
+        # ------------------------------------------------------------------
+        # Explicitly store full complexity information in the record
+        # ------------------------------------------------------------------
+
+        record[
+            "complexity"
+        ] = complexity.to_dict()
+
+        record[
+            "E"
+        ] = float(
+            complexity.E
+        )
+
+        # ------------------------------------------------------------------
+        # Temporary compatibility with both token-history names
+        # ------------------------------------------------------------------
 
         token_entries = record.get(
             "token_entries",
@@ -757,9 +847,9 @@ def main(
             ),
         )
 
-        # --------------------------------------------------------------
-        # Derive metrics from token-level records.
-        # --------------------------------------------------------------
+        # ------------------------------------------------------------------
+        # Derive metrics from token-level records
+        # ------------------------------------------------------------------
 
         content_entries = [
             entry
@@ -834,11 +924,12 @@ def main(
             )
         )
 
-        # --------------------------------------------------------------
-        # Question-level result.
-        # --------------------------------------------------------------
+        # ------------------------------------------------------------------
+        # Question-level result
+        # ------------------------------------------------------------------
 
         question_rows.append({
+
             "test_id":
                 test_id,
 
@@ -926,9 +1017,9 @@ def main(
                 trigger_index,
         })
 
-        # --------------------------------------------------------------
-        # Token-level result.
-        # --------------------------------------------------------------
+        # ------------------------------------------------------------------
+        # Token-level results
+        # ------------------------------------------------------------------
 
         for fallback_index, entry in enumerate(
             token_entries
@@ -958,6 +1049,7 @@ def main(
             )
 
             token_rows.append({
+
                 "test_id":
                     test_id,
 
@@ -969,6 +1061,18 @@ def main(
 
                 "answer":
                     answer_text,
+
+                "complexity_class":
+                    complexity.predicted_class,
+
+                "p_A":
+                    complexity.p_A,
+
+                "p_B":
+                    complexity.p_B,
+
+                "p_C":
+                    complexity.p_C,
 
                 "E":
                     complexity.E,
@@ -1023,11 +1127,8 @@ def main(
             })
 
         print(
-            f"  E = {complexity.E:.4f}"
-        )
-
-        print(
-            f"  Full K trigger = {full_triggered}"
+            f"  Full K trigger = "
+            f"{full_triggered}"
         )
 
         print(
@@ -1038,12 +1139,13 @@ def main(
         if trigger_token is not None:
 
             print(
-                f"  Trigger token = {trigger_token!r}"
+                f"  Trigger token = "
+                f"{trigger_token!r}"
             )
 
-    # ------------------------------------------------------------------
-    # 9. DataFrames.
-    # ------------------------------------------------------------------
+    # ----------------------------------------------------------------------
+    # 9. DataFrames
+    # ----------------------------------------------------------------------
 
     results_df = pd.DataFrame(
         question_rows
@@ -1053,9 +1155,9 @@ def main(
         token_rows
     )
 
-    # ------------------------------------------------------------------
-    # 10. Save.
-    # ------------------------------------------------------------------
+    # ----------------------------------------------------------------------
+    # 10. Save
+    # ----------------------------------------------------------------------
 
     results_path = (
         result_dir
@@ -1077,9 +1179,9 @@ def main(
         index=False,
     )
 
-    # ------------------------------------------------------------------
-    # 11. Print question-level table.
-    # ------------------------------------------------------------------
+    # ----------------------------------------------------------------------
+    # 11. Print question-level results
+    # ----------------------------------------------------------------------
 
     print(
         "\n"
@@ -1115,9 +1217,34 @@ def main(
         )
     )
 
-    # ------------------------------------------------------------------
-    # 12. Category summary.
-    # ------------------------------------------------------------------
+    # ----------------------------------------------------------------------
+    # 12. Complexity class summary
+    # ----------------------------------------------------------------------
+
+    if not results_df.empty:
+
+        class_summary = (
+            results_df[
+                "complexity_class"
+            ]
+            .value_counts(
+                dropna=False
+            )
+        )
+
+        print(
+            "\nAdaptive-RAG predicted classes:"
+        )
+
+        for label, count in class_summary.items():
+
+            print(
+                f"  {label}: {count}"
+            )
+
+    # ----------------------------------------------------------------------
+    # 13. Category summary
+    # ----------------------------------------------------------------------
 
     if not results_df.empty:
 
@@ -1128,6 +1255,7 @@ def main(
                 dropna=False,
             )
             .agg(
+
                 n_tests=(
                     "test_id",
                     "count",
@@ -1135,6 +1263,11 @@ def main(
 
                 mean_E=(
                     "E",
+                    "mean",
+                ),
+
+                mean_confidence=(
+                    "mean_m_tilde",
                     "mean",
                 ),
 
@@ -1180,9 +1313,9 @@ def main(
 
         category_path = None
 
-    # ------------------------------------------------------------------
-    # 13. Final paths.
-    # ------------------------------------------------------------------
+    # ----------------------------------------------------------------------
+    # 14. Final paths
+    # ----------------------------------------------------------------------
 
     print(
         "\nSaved results:"
@@ -1211,7 +1344,8 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(
         description=(
-            "Run the qualitative live INKER IE-KRT test suite."
+            "Run the qualitative live INKER IE-KRT test suite "
+            "using the local Adaptive-RAG LoRA complexity evaluator."
         )
     )
 
@@ -1226,12 +1360,13 @@ if __name__ == "__main__":
     )
 
     parser.add_argument(
-        "--complexity-model",
+        "--complexity-adapter",
         type=str,
-        default=DEFAULT_ADAPTIVE_RAG_MODEL,
+        default=None,
         help=(
-            "Adaptive-RAG-style T5 complexity model. "
-            f"Default: {DEFAULT_ADAPTIVE_RAG_MODEL}"
+            "Optional override for the Adaptive-RAG LoRA adapter. "
+            "May point to an extracted adapter directory or ZIP. "
+            "If omitted, complexity.adapter_path is read from config."
         ),
     )
 
@@ -1248,6 +1383,6 @@ if __name__ == "__main__":
 
     main(
         config_path=args.config,
-        complexity_model=args.complexity_model,
+        complexity_adapter=args.complexity_adapter,
         num_tests=args.num_tests,
     )
