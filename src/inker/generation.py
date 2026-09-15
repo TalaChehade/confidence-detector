@@ -14,7 +14,7 @@ For each generated token t_i, the procedure is:
     3. Extract its hidden state from every confidence-detector layer.
     4. Project those hidden states onto the learned confidence directions.
     5. Average the signed layer projections to obtain raw confidence m_i.
-    6. Causally normalize the confidence score to obtain m_tilde_i.
+    6. Calibrate the raw confidence score onto [0, 1] to obtain m_tilde_i.
     7. Compute the content mask s_i.
     8. Combine internal confidence with external query complexity:
 
@@ -72,26 +72,29 @@ Layer scores are averaged:
 
     m_i = mean_l(m_i^(l))
 
-Causal normalization
---------------------
-At generation step i:
+Absolute confidence calibration
+-------------------------------
+The raw representation-reader score is converted to [0, 1] independently for
+each token.  This avoids per-answer min-max scaling, which can incorrectly map
+a weak raw score to 1.0 merely because it is the largest score seen so far.
 
-    m_tilde_i = scale([m_0, ..., m_i])[-1]
+The default calibration is a monotonic logistic transform:
 
-using causal min-max scaling.
+    m_tilde_i = sigmoid((m_i - center) / scale)
 
-Only scores that already exist at generation step i are used.
-
-No future token confidence is available or used.
+If the saved representation reader contains a ``confidence_calibration`` block,
+its ``center`` and ``scale`` values are used.  Otherwise conservative defaults
+are used.  Because the transformation is absolute, formatting tokens do not
+change the confidence assigned to later content tokens.
 
 Content mask
 ------------
 Confidence is calculated BEFORE the content mask is applied.
 
-Every ordinary generated token therefore contributes to the causal confidence
-history.
+Every ordinary generated token can still be scored for diagnostics, but a
+formatting token cannot change the calibrated confidence of a later token.
 
-After normalization:
+After calibration:
 
     s_i = 1
         for content-bearing tokens.
@@ -283,35 +286,147 @@ def get_content_mask(
 
 
 # ==========================================================================
-# Causal normalization
+# Absolute confidence calibration
 # ==========================================================================
+
+# These defaults keep the public API backward-compatible for existing readers.
+# A better repository-level workflow is to save empirically fitted calibration
+# parameters inside rep_reader["confidence_calibration"] during detector
+# training.  generation.py will automatically use them when present.
+DEFAULT_CONFIDENCE_CENTER = 0.0
+DEFAULT_CONFIDENCE_SCALE = 0.20
+
+
+def _resolve_confidence_calibration(
+    rep_reader: Dict[str, Any],
+) -> tuple[float, float]:
+    """
+    Return the absolute raw-score calibration parameters.
+
+    Supported optional reader metadata::
+
+        rep_reader["confidence_calibration"] = {
+            "center": 0.0,
+            "scale": 0.20,
+        }
+
+    ``center`` is the raw score corresponding to m_tilde=0.5.
+    ``scale`` controls the slope of the monotonic logistic transform.
+
+    Existing representation readers created before calibration metadata was
+    added remain usable through the defaults above.
+    """
+
+    calibration = rep_reader.get(
+        "confidence_calibration",
+        {},
+    )
+
+    center = float(
+        calibration.get(
+            "center",
+            DEFAULT_CONFIDENCE_CENTER,
+        )
+    )
+
+    scale = float(
+        calibration.get(
+            "scale",
+            DEFAULT_CONFIDENCE_SCALE,
+        )
+    )
+
+    if not np.isfinite(center):
+        raise ValueError(
+            "confidence calibration center must be finite."
+        )
+
+    if (
+        not np.isfinite(scale)
+        or scale <= 0.0
+    ):
+        raise ValueError(
+            "confidence calibration scale must be a finite value > 0."
+        )
+
+    return center, scale
+
+
+def calibrate_raw_confidence_score(
+    raw_score: float,
+    *,
+    center: float = DEFAULT_CONFIDENCE_CENTER,
+    scale: float = DEFAULT_CONFIDENCE_SCALE,
+) -> float:
+    """
+    Convert one raw representation-reader score m_i to m_tilde_i in [0, 1].
+
+    The transformation is:
+
+        z = (m_i - center) / scale
+        m_tilde_i = sigmoid(z)
+
+    Higher raw detector scores therefore always map to higher normalized
+    confidence, while the same raw score always receives the same normalized
+    value regardless of the other tokens generated in the answer.
+
+    This fixes the failure mode of causal per-answer min-max normalization,
+    where a token could receive m_tilde=1 simply because it was the current
+    maximum even when its absolute raw score was weak or negative.
+    """
+
+    raw_score = float(raw_score)
+    center = float(center)
+    scale = float(scale)
+
+    if not np.isfinite(raw_score):
+        raise ValueError(
+            f"raw_score must be finite, received {raw_score}."
+        )
+
+    if not np.isfinite(center):
+        raise ValueError(
+            f"center must be finite, received {center}."
+        )
+
+    if (
+        not np.isfinite(scale)
+        or scale <= 0.0
+    ):
+        raise ValueError(
+            f"scale must be finite and > 0, received {scale}."
+        )
+
+    # Clip for numerical stability before exp().
+    z = float(
+        np.clip(
+            (raw_score - center) / scale,
+            -60.0,
+            60.0,
+        )
+    )
+
+    return float(
+        1.0
+        / (
+            1.0
+            + np.exp(-z)
+        )
+    )
+
 
 def compute_current_causal_normalized_score(
     raw_history: Sequence[float],
+    *,
+    center: float = DEFAULT_CONFIDENCE_CENTER,
+    scale: float = DEFAULT_CONFIDENCE_SCALE,
 ) -> float:
     """
-    Compute m_tilde_i for the most recently generated token.
+    Backward-compatible wrapper for older experiment code.
 
-    Given the raw confidence history:
-
-        [m_0, m_1, ..., m_i]
-
-    calculate:
-
-        lo_i = min(m_0, ..., m_i)
-
-        hi_i = max(m_0, ..., m_i)
-
-    and:
-
-                        m_i - lo_i
-        m_tilde_i = ----------------
-                       hi_i - lo_i
-
-    If only one score exists, or if all values are equal, a neutral value of
-    0.5 is returned.
-
-    This computation is causal because it never uses future token scores.
+    Despite the historical function name, normalization is no longer performed
+    against the prefix min/max.  Only the most recent raw score is calibrated
+    using the fixed absolute mapping.
     """
 
     if not raw_history:
@@ -319,58 +434,34 @@ def compute_current_causal_normalized_score(
             "raw_history cannot be empty."
         )
 
-    if len(raw_history) == 1:
-        return 0.5
-
-    lo = min(
-        raw_history
-    )
-
-    hi = max(
-        raw_history
-    )
-
-    if hi - lo < 1e-8:
-        return 0.5
-
-    return float(
-        (
-            raw_history[-1]
-            - lo
-        )
-        / (
-            hi
-            - lo
-        )
+    return calibrate_raw_confidence_score(
+        raw_history[-1],
+        center=center,
+        scale=scale,
     )
 
 
 def compute_causal_normalized_scores(
     raw_vals: Sequence[float],
+    *,
+    center: float = DEFAULT_CONFIDENCE_CENTER,
+    scale: float = DEFAULT_CONFIDENCE_SCALE,
 ) -> List[float]:
     """
-    Compute causal normalized confidence for an entire sequence.
+    Backward-compatible sequence helper using absolute calibration.
 
-    This helper is retained because experiment and visualization scripts may
-    still need to normalize a previously stored raw-confidence sequence.
-
-    Each position is normalized using only its own prefix.
+    Each score is calibrated independently.  Therefore adding/removing an
+    unrelated token cannot change the normalized confidence of another token.
     """
 
-    normalized = []
-
-    for i in range(
-        len(raw_vals)
-    ):
-        normalized.append(
-            compute_current_causal_normalized_score(
-                raw_vals[
-                    :i + 1
-                ]
-            )
+    return [
+        calibrate_raw_confidence_score(
+            raw_value,
+            center=center,
+            scale=scale,
         )
-
-    return normalized
+        for raw_value in raw_vals
+    ]
 
 
 # ==========================================================================
@@ -1010,18 +1101,24 @@ def _live_generate(
         )
 
         # --------------------------------------------------------------
-        # 6. Causal normalization.
+        # 6. Absolute confidence calibration.
         #
-        # m_tilde_i depends ONLY on:
-        #
-        #     m_0 ... m_i
-        #
-        # and therefore contains no future information.
+        # m_tilde_i depends only on the current raw confidence m_i and the
+        # fixed calibration parameters.  Earlier formatting/stop-word tokens
+        # therefore cannot redefine the confidence scale for this token.
         # --------------------------------------------------------------
 
+        calibration_center, calibration_scale = (
+            _resolve_confidence_calibration(
+                rep_reader
+            )
+        )
+
         m_tilde = (
-            compute_current_causal_normalized_score(
-                raw_history
+            calibrate_raw_confidence_score(
+                raw_score,
+                center=calibration_center,
+                scale=calibration_scale,
             )
         )
 
